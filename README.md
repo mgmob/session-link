@@ -114,28 +114,12 @@ because each headless run **appends** to its session file (`pi --session <file>`
 
 ## Install
 
-This machine (from source):
+From the GitHub repo:
 
 ```bash
-cd /home/mg/Projects/session-link
-pi install .            # registers it in ~/.pi/agent/settings.json
-# or try without installing:
-pi -e .
-```
-
-Another machine (pick one):
-
-```bash
-# A) published to npm
-pi install npm:session-link
-
-# B) from a local tarball (works for an air-gapped / "other machine" transfer)
-npm pack            # produces session-link-0.1.0.tgz
-# copy the .tgz to the other machine, then:
-pi install /absolute/path/to/session-link-0.1.0.tgz
-
-# C) from git
-pi install git:github.com/<you>/session-link
+pi install git:github.com/mgmob/session-link
+# or try it without installing:
+pi -e git:github.com/mgmob/session-link
 ```
 
 `pi` loads the TypeScript directly — there is no build step. The pi core packages
