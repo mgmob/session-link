@@ -184,11 +184,10 @@ function buildPreloadPrompt(handoffFile: string, language?: string): string {
 	lines.push("2. Read the handoff file at the path above.");
 	lines.push("3. Read every file it references (its `files` list, and anything cited in its context note).");
 	lines.push("4. Report your understanding of the context, concisely.");
-	lines.push("5. Identify uncertainties / open questions. The handoff's context note flags at least one item that was DELIBERATELY NOT written down — name it explicitly.");
-	lines.push("6. Resolve each uncertainty by calling the `session_link` tool to query the previous session headlessly. Do NOT guess; the previous session's context is the only source for anything not in the handoff.");
+	lines.push("5. Only if something is genuinely unclear or missing (and is NOT spelled out in the handoff or the files above): resolve each such uncertainty by calling the `session_link` tool to query the previous session headlessly. Do NOT guess — the previous session's context is the only source for anything not written down. (It is fine and expected to find zero uncertainties — a clean handoff needs no query.)");
 	lines.push('   - If `session_link` returns `kind: "clarification"`, show those questions to me, collect my answers, then call it again with `clarifications: [...]`.');
 	lines.push("   - You may call `session_link` multiple times; each round is appended to the previous session, so it remembers earlier answers.");
-	lines.push('7. When uncertainties are resolved, report "context accepted" with a short summary, then wait for my next instruction.');
+	lines.push('6. Once you have the context (and any real uncertainties are resolved), report "context accepted" with a short summary — state explicitly whether there were uncertainties to chase down — then wait for my next instruction. Do not query the previous session just for the sake of it.');
 	lines.push("");
 	lines.push("Narrate each step so I can follow along.");
 	return lines.join("\n");

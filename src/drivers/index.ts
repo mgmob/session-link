@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import spawn from "cross-spawn";
 import type { AskRequest, AskResult, DriverName, Handoff, SessionDriver } from "../types.ts";
 import { parseResponse, wrapQuestion } from "../clarify.ts";
 import { piDriver } from "./pi.ts";
@@ -53,17 +54,21 @@ function runCapture(
 		}
 		if (opts.signal) opts.signal.addEventListener("abort", onAbort);
 
-		child.stdout.on("data", (d) => {
+		child.stdout!.on("data", (d) => {
 			stdout += d;
 		});
-		child.stderr.on("data", (d) => {
+		child.stderr!.on("data", (d) => {
 			stderr += d;
 		});
-		child.on("error", (err) => {
+		child.on("error", (err: any) => {
 			if (settled) return;
 			settled = true;
 			cleanup();
-			reject(new Error(`Failed to spawn '${cmd}': ${err.message}`));
+			if (err && err.code === "ENOENT") {
+				reject(new Error(enoentMessage(cmd, err)));
+			} else {
+				reject(new Error(`Failed to spawn '${cmd}': ${err?.message ?? err}`));
+			}
 		});
 		child.on("close", (code) => {
 			if (settled) return;
@@ -84,7 +89,24 @@ function runCapture(
 	});
 }
 
-function killChild(child: ReturnType<typeof spawn>) {
+/** Build a helpful message for ENOENT (binary not on PATH / wrong Windows shim). */
+function enoentMessage(cmd: string, err: any): string {
+	const hint =
+		process.platform === "win32"
+			? "On Windows the global npm shim is 'pi.cmd' (not 'pi.exe'). Resolution now applies PATHEXT, " +
+				"so this usually means the binary is genuinely not on PATH in this process's environment " +
+				"(e.g. pi is installed for a different shell/user). Point SESSION_LINK_PI_BIN (or PI_BIN) at " +
+				"the absolute path of the shim — find it with `where pi` (e.g. ...\\pi.cmd)."
+			: "The binary is not on PATH in this process's environment. Set SESSION_LINK_PI_BIN (or PI_BIN) " +
+				"to its absolute path, or ensure it is installed for this user.";
+	return (
+		`Cannot run '${cmd}': executable not found (ENOENT).\n` +
+		`${hint}\n` +
+		`Verify in a shell first: '${cmd} --version'. (Original error: ${err?.message ?? err})`
+	);
+}
+
+function killChild(child: ChildProcess) {
 	try {
 		child.kill("SIGTERM");
 	} catch {

@@ -35,8 +35,8 @@ Earlier prototype was called `ask-prev-session` (command `/askprev`, tool
 - **Auto-start vs. manual review.** `/session-link` now takes an optional leading
   mode:
   - **`/session-link auto [note]`** — the new session runs context-acceptance
-    immediately (reads the handoff, finds uncertainties, queries the previous
-    session on its own).
+    immediately (reads the handoff, and — only if anything is unclear —
+    queries the previous session on its own).
   - **`/session-link manual [note]`** — the acceptance task is left as an
     editable draft in the editor; you review the handoff + prompt and press
     **Enter** to start. This is the cautious default.
@@ -57,8 +57,8 @@ Earlier prototype was called `ask-prev-session` (command `/askprev`, tool
   next session. This command requires interactive **TUI** mode (the two below,
   `/session-link-write` and `/session-link-show`, work in any mode). In `auto`
   the new agent immediately self-identifies, reads the handoff + referenced
-  files, reports understanding, finds uncertainties, and resolves them by
-  querying the previous session; if the new session can't receive an
+  files, reports understanding, and — if there are any uncertainties —
+  resolves them by querying the previous session; if the new session can't receive an
   auto-submitted message directly, the task falls back to an editable draft
   exactly like `manual`. In `manual` (default) the same task waits as a draft in
   the editor — review it, then press Enter.
@@ -116,6 +116,9 @@ because each headless run **appends** to its session file (`pi --session <file>`
 
 From the GitHub repo:
 
+**Prerequisites:** Node.js `>= 22.19.0` (same minimum the pi core packages require;
+they're pulled in as peer dependencies).
+
 ```bash
 pi install git:github.com/mgmob/session-link
 # or try it without installing:
@@ -125,13 +128,19 @@ pi -e git:github.com/mgmob/session-link
 `pi` loads the TypeScript directly — there is no build step. The pi core packages
 and `typebox` are `peerDependencies` (provided by your pi installation).
 
+> Seeing `npm warn EBADENGINE ... required: { node: '>=22.19.0' }` during install?
+> The system Node.js is too old — the warning prints the current version right next
+> to the required one. Upgrade Node to a current 22.x (`>= 22.19.0`, e.g. via nvm/fnm)
+> and the warnings disappear. They're warnings, not errors (install still completes),
+> but pi targets that Node, so don't stay on an older one.
+
 ## Environment knobs
 
 | var | default | meaning |
 | --- | --- | --- |
 | `SESSION_LINK_TIMEOUT_MS` | `300000` (5 min) | per-query timeout |
 | `SESSION_LINK_PI_TOOLS` | `read,grep,find,ls` | tools the resumed previous session may use (read-only by default; also excludes our own tools, which breaks recursion) |
-| `SESSION_LINK_PI_BIN` / `PI_BIN` | `pi` | the pi binary used for headless resume |
+| `SESSION_LINK_PI_BIN` / `PI_BIN` | `pi` | the pi binary used for headless resume. Resolved via `cross-spawn`, so the global npm shim (`pi` / `pi.cmd` / `pi.ps1`) is found on Windows too. If the shim is genuinely off PATH in the process, set this to its absolute path. |
 | `SESSION_LINK_DEFAULT_MODE` | `manual` | default start mode when `/session-link` is called without an explicit `auto`/`manual` argument. Set to `auto` for hands-off handoffs. |
 | `SESSION_LINK_LANGUAGE` | *(auto-detect)* | force the conversation language carried into the next session (e.g. `Russian`). By default it is detected from the closing session's recent user messages. |
 
@@ -150,7 +159,7 @@ and `typebox` are `peerDependencies` (provided by your pi installation).
 → writes `.pi/session_link/handoff.json` and opens a fresh session. In `auto`
 (or if `SESSION_LINK_DEFAULT_MODE=auto`) the new agent runs the full
 context-acceptance task by itself: reads the handoff, reports understanding,
-finds uncertainties, and queries the previous session to resolve them;
+finds uncertainties, and — if there are any — queries the previous session to resolve them;
 clarifications bounce through you; when satisfied, it reports "context
 accepted" and waits for your next instruction. In `manual` the same task sits
 as a draft for you to review first.
@@ -166,3 +175,4 @@ as a draft for you to review first.
 - The resumed previous session is restricted to read-only tools by default to
   keep "answering questions" safe and side-effect-free; broaden via
   `SESSION_LINK_PI_TOOLS` if you trust it to investigate.
+- **Windows**: works. The headless resume is spawned via [`cross-spawn`](https://www.npmjs.com/package/cross-spawn), which resolves PATH and `PATHEXT` (so `pi` finds `pi.cmd`) without a shell — `{QUESTION}` is passed as a real argv element, never interpolated into a shell string. If you still see an `ENOENT` from `session_link`, the binary isn't on PATH for that process; point `SESSION_LINK_PI_BIN` at the absolute `pi.cmd` (find it with `where pi`).

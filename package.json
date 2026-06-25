@@ -3,10 +3,14 @@
   "version": "0.1.0",
   "description": "pi extension: link sessions via a context handoff with a back-channel. /session-link writes a handoff and auto-starts the next session, which can query the previous one headlessly (with clarification relay). Portable driver model (pi / claude-code / qwen).",
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "scripts": {
     "clean": "echo 'nothing to clean'",
@@ -17,8 +21,15 @@
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "cross-spawn": "^7.0.6"
   }
 }
