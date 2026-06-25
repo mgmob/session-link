@@ -101,7 +101,9 @@ That separation is what makes the same next-session tool work across platforms:
 a Claude Code / Qwen handoff just needs to be authored in the **same JSON
 schema** (see `src/types.ts`) with its own `driver` and `askCommand`. Authoring
 those handoffs from inside Claude Code / Qwen (a hook or slash command) is the
-portable follow-up; this package ships the pi side fully working.
+portable follow-up; this package ships the pi side fully working. For the Claude
+Code side specifically (back-channel command, `CLARIFY:` contract, handoff shape),
+see [docs/claude-code-backchannel.md](docs/claude-code-backchannel.md).
 
 ### Clarification relay
 
