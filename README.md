@@ -140,7 +140,7 @@ and `typebox` are `peerDependencies` (provided by your pi installation).
 | --- | --- | --- |
 | `SESSION_LINK_TIMEOUT_MS` | `300000` (5 min) | per-query timeout |
 | `SESSION_LINK_PI_TOOLS` | `read,grep,find,ls` | tools the resumed previous session may use (read-only by default; also excludes our own tools, which breaks recursion) |
-| `SESSION_LINK_PI_BIN` / `PI_BIN` | `pi` | the pi binary used for headless resume. Resolved via `cross-spawn`, so the global npm shim (`pi` / `pi.cmd` / `pi.ps1`) is found on Windows too. If the shim is genuinely off PATH in the process, set this to its absolute path. |
+| `SESSION_LINK_PI_BIN` / `PI_BIN` | `pi` | the pi binary used for headless resume. The binary is resolved via PATH + `PATHEXT` by the extension itself (so the global npm shim `pi` / `pi.cmd` is found on Windows too). If the shim is genuinely off PATH in the process, set this to its absolute path. |
 | `SESSION_LINK_DEFAULT_MODE` | `manual` | default start mode when `/session-link` is called without an explicit `auto`/`manual` argument. Set to `auto` for hands-off handoffs. |
 | `SESSION_LINK_LANGUAGE` | *(auto-detect)* | force the conversation language carried into the next session (e.g. `Russian`). By default it is detected from the closing session's recent user messages. |
 
@@ -175,4 +175,4 @@ as a draft for you to review first.
 - The resumed previous session is restricted to read-only tools by default to
   keep "answering questions" safe and side-effect-free; broaden via
   `SESSION_LINK_PI_TOOLS` if you trust it to investigate.
-- **Windows**: works. The headless resume is spawned via [`cross-spawn`](https://www.npmjs.com/package/cross-spawn), which resolves PATH and `PATHEXT` (so `pi` finds `pi.cmd`) without a shell — `{QUESTION}` is passed as a real argv element, never interpolated into a shell string. If you still see an `ENOENT` from `session_link`, the binary isn't on PATH for that process; point `SESSION_LINK_PI_BIN` at the absolute `pi.cmd` (find it with `where pi`).
+- **Windows**: works. The headless resume resolves PATH and `PATHEXT` itself (so `pi` finds `pi.cmd`) and runs a `.cmd`/`.bat` shim through `cmd.exe` with verbatim-escaped arguments — `{QUESTION}` is passed as a real argv element, never interpolated into a shell string. This is self-contained: there are no runtime `dependencies` (only `peerDependencies` provided by pi), so the package loads from a git cache with no `node_modules`. If you still see an `ENOENT` from `session_link`, the binary isn't on PATH for that process; point `SESSION_LINK_PI_BIN` at the absolute `pi.cmd` (find it with `where pi`).

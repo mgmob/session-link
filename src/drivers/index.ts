@@ -1,5 +1,5 @@
 import type { ChildProcess } from "node:child_process";
-import spawn from "cross-spawn";
+import { spawnBin } from "./spawn.ts";
 import type { AskRequest, AskResult, DriverName, Handoff, SessionDriver } from "../types.ts";
 import { parseResponse, wrapQuestion } from "../clarify.ts";
 import { piDriver } from "./pi.ts";
@@ -28,7 +28,7 @@ function runCapture(
 	opts: { cwd: string; timeoutMs: number; signal?: AbortSignal },
 ): Promise<Captured> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(cmd, args, { cwd: opts.cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawnBin(cmd, args, { cwd: opts.cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
 		let settled = false;
