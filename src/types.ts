@@ -1,19 +1,35 @@
 /**
  * Shared types for session-link.
  *
- * The handoff is a small JSON document that the CLOSING session writes. It tells
- * the next session two things:
- *   1. who to talk to (driver + sessionRef), and
- *   2. exactly how to resume it headlessly (askCommand: an argv template with a
- *      "{QUESTION}" placeholder), so the next session never has to guess the
- *      platform-specific flags.
+ * The handoff is a small JSON document with two zones:
+ *   - ENVELOPE (owner = code): who to talk to + how to resume it headlessly.
+ *     Fields like sessionRef / askCommand / driver / model / cwd / timestamps are
+ *     written by buildHandoff; the agent must never author them.
+ *   - BODY (owner = the closing agent): what was actually done and decided.
+ *     goal/summary/nextStep form the mandatory "spine"; the rest are optional.
  *
- * The `driver` field only selects the OUTPUT PARSER (how the raw stdout of the
- * headless run is turned into text). The invocation itself lives in askCommand,
- * so adding a new platform is: author its askCommand when closing + add a parser.
+ * `driver` only selects the OUTPUT PARSER (how the raw stdout of the headless
+ * run is turned into text). The invocation itself lives in askCommand, so adding
+ * a new platform is: author its askCommand when closing + add a parser.
  */
 
 export type DriverName = "pi" | "claude-code" | "qwen";
+
+/** How /session-link starts the next session: review-first, or unattended. */
+export type StartMode = "auto" | "manual";
+
+export interface HandoffDecision {
+	decision: string;
+	rationale: string;
+}
+
+export interface HandoffSection {
+	title: string;
+	/** Markdown body. */
+	body: string;
+	/** Optional paths the next session should read alongside this section. */
+	files?: string[];
+}
 
 export interface Handoff {
 	schema: "session-link/handoff/v1";
@@ -30,13 +46,41 @@ export interface Handoff {
 	howToAsk: string;
 	/** Argv template. The element "{QUESTION}" is replaced with the wrapped question at runtime. No shell, no injection. */
 	askCommand: string[];
-	/** Recent user-message topics (truncated), to seed the next session's understanding. */
-	topics?: string[];
-	/** Optional free-form context note authored by the closing agent/user. */
+
+	// ── BODY (agent-authored) ────────────────────────────────────────────────
+	/** Overarching objective — WHY this work exists, what "done" looks like. Mandatory for a ready handoff. */
+	goal?: string;
+	/** What was ACTUALLY done/decided this session (markdown). Mandatory for a ready handoff. */
+	summary?: string;
+	/** Where the next session picks up / what "done" looks like here. Mandatory for a ready handoff. */
+	nextStep?: string;
+	/** Blockers and what unblocks them. */
+	blockers?: string[];
+	/** Consequential choices WITH why, so they aren't re-litigated. */
+	decisions?: HandoffDecision[];
+	/** Paths created/edited this session. */
+	filesChanged?: string[];
+	/** Paths the next session MUST read to be productive. */
+	filesToRead?: string[];
+	/** Gotchas, versions, repro commands (free-form lines or key/value). */
+	environment?: string[] | Record<string, string>;
+	/** Things deliberately not done/not written down — guards against false "done". */
+	deliberatelySkipped?: string[];
+	/** Free-form ordered list for anything the fixed fields don't capture. The agent owns the titles. */
+	sections?: HandoffSection[];
+
+	// ── legacy / fallback author content ────────────────────────────────────
+	/** Optional free-form context note authored by the closing user (the /session-link argument). */
 	contextNote?: string;
-	/** Optional list of file paths the next session should read. */
+	/** Optional list of file paths the next session should read (superseded by filesToRead when present). */
 	files?: string[];
-	/** Previous handoff in a chain, if any. */
+
+	// ── commit / chain ───────────────────────────────────────────────────────
+	/** Stamp of the last `/session-link-go` that started a child from this handoff (fork-detection hint). */
+	committedAt?: string;
+	/** Session file of the last child started from this handoff. */
+	committedSessionFile?: string;
+	/** Previous handoff in a chain (always an immutable archive path, never the live handoff.json). */
 	parentHandoffPath?: string;
 	/** Conversation language to carry into the next session (e.g. "Russian"). Auto-detected or set via SESSION_LINK_LANGUAGE. */
 	language?: string;
@@ -65,3 +109,4 @@ export interface SessionDriver {
 	/** Parse raw stdout from a headless run into the previous session's textual reply. */
 	parseOutput(raw: string): string;
 }
+
