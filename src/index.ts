@@ -14,13 +14,19 @@
  *      re-presents. Loop until satisfied — no special machinery.
  *   3. `/session-link-go` validates the mandatory spine, (optionally) warns about
  *      a fork if this handoff already started a child, then starts a new session
- *      and places the starter prompt (a thin pointer at the handoff file) into the
- *      new session's editor — the user presses Enter to kick off context
- *      acceptance. (We use setEditorText, not sendUserMessage: in pi 0.80.x the
- *      latter leaves a no-ref'ed-handles window during session replacement and
- *      the process exits to the shell once the injected turn finishes.) `auto`
- *      mode does steps 1→3 with the same editor-placement (so it is no longer
- *      fully unattended — one Enter is required in the new session).
+ *      and injects the starter prompt (a thin pointer at the handoff file) via
+ *      sendUserMessage so context acceptance begins immediately. To keep pi
+ *      alive across the session replacement we arm a PERMANENT process-level
+ *      keepalive (the same `setInterval(() => {}, 2**30)` trick pi itself uses
+ *      in handleCtrlZ); it is cleared ONLY by the first real keypress in the
+ *      new session (proof the REPL is reading stdin). There is deliberately NO
+ *      time-based fallback: a context-acceptance or authoring turn routinely
+ *      runs >30s, so a timed clear would fire mid-turn and re-introduce the
+ *      exact exit it exists to prevent (confirmed from session logs). Just
+ *      (pi.setSessionName) to a short title derived from `goal`, so pi's /resume
+ *      list distinguishes it from sibling handoff sessions; the new session is
+ *      initially labelled `→ <title>` (continuation) and gets its own title at
+ *      the NEXT handoff. `auto` mode does steps 1→3 the same way, unattended.
  *   4. New session: `current_session` (self-id) → read handoff (its BODY is the
  *      context) → read referenced files → report understanding → resolve any real
  *      uncertainty via the `session_link` tool (headless resume of the previous
@@ -303,6 +309,7 @@ function buildAuthorPrompt(handoffFile: string, starterPrompt: string, language:
 	lines.push("");
 	lines.push("Optional — include ONLY those that carry real information for THIS task; omit any that would be empty filler (that is expected and good):");
 	lines.push("- `blockers`: string[] — each item names the blocker and what unblocks it.");
+	lines.push("- `sessionTitle`: string — a short 2–5 word label for THIS session's work (noun phrase, no trailing period). Shown in pi's /resume session list so sessions aren't indistinguishable. Optional: if omitted, the code derives one from `goal`.");
 	lines.push("- `decisions`: array of { decision, rationale } — consequential choices with WHY, so they aren't re-litigated or undone.");
 	lines.push("- `filesChanged`: string[] — paths created/edited this session. Keep it a plain manifest of paths (the character of each change belongs in `summary` or a `sections` entry like \"Changes by file\", not here).");
 	lines.push("- `filesToRead`: string[] — paths the next session MUST read to be productive.");
@@ -364,39 +371,145 @@ function sendAuthorTurn(pi: ExtensionAPI, ctx: ExtensionCommandContext, prompt: 
 	}
 }
 
-/** Start the next session with the starter prompt placed in its editor.
+/**
+ * Process-level keepalive that holds the Node event loop alive across session
+ * replacement.
  *
- * Why setEditorText instead of sendUserMessage: in pi 0.80.x, injecting the
- * starter prompt via `sendUserMessage` inside `withSession` leaves a window
- * during session replacement where Node has no ref'ed handles, so once the
- * injected turn finishes the process exits to the shell (clean exit, code 0,
- * empty stderr) instead of staying interactive. Putting the prompt in the
- * editor lets the REPL enter its normal input loop (which holds stdin) and
- * stay alive; the user presses Enter to kick off context acceptance. */
+ * Symptom being fixed: after ctx.newSession the REPL can be left momentarily
+ * without a ref'ed handle, so once any pending activity drains Node exits
+ * cleanly (code 0, empty stderr) instead of staying interactive — pi exits to
+ * the shell right after `/session-link-go`. pi itself solves the identical
+ * problem in handleCtrlZ with `setInterval(() => {}, 2 ** 30)`; we reuse that
+ * trick verbatim.
+ *
+ * Why module-level: the OLD extension runtime is torn down during session
+ * replacement (session_shutdown, reason "new"), but the keepalive must span
+ * the transition into the NEW runtime. Only a process-scoped timer (not a
+ * closure captured by the old runtime) survives, so it lives here at module
+ * scope. The NEW runtime's `input` handler clears it once the REPL is provably
+ * alive.
+ *
+ * Why NO time-based fallback: a prior version armed a 30s `setTimeout` that
+ * cleared the interval as "leak hygiene". Session logs proved this is wrong —
+ * a context-acceptance turn (current_session → read handoff → git diff →
+ * report) ran ~32s, so the fallback fired mid-turn, and when the agent went
+ * idle the now-cleared keepalive let the event loop drain → the very exit
+ * the keepalive exists to prevent. Turn durations are unbounded, so ANY fixed
+ * timeout is a race. The interval is cleared ONLY on the first INTERACTIVE
+ * keypress (proof the REPL holds stdin on its own); a single no-op interval
+ * cleared on first keypress is not a leak.
+ */
+let handoffKeepalive: ReturnType<typeof setInterval> | undefined;
+
+function clearHandoffKeepalive(): void {
+	if (handoffKeepalive !== undefined) {
+		clearInterval(handoffKeepalive);
+		handoffKeepalive = undefined;
+	}
+}
+
+/** Prefix marking a freshly-started session as a continuation of its parent
+ *  handoff, so the /resume list reads as a chain until the session earns its
+ *  own title at the next handoff. */
+const CONTINUATION_PREFIX = "→ ";
+const MAX_SESSION_TITLE_CHARS = 48;
+const MAX_SESSION_TITLE_WORDS = 5;
+
+/** First sentence of `s` (up to the first . ! ? …), trimmed; "" if empty. */
+function firstSentence(s: string | undefined): string {
+	if (!s) return "";
+	const t = s.trim();
+	if (!t) return "";
+	const stop = t.search(/[.!\u2026]/);
+	return stop === -1 ? t : t.slice(0, stop);
+}
+
+/** A short label for the session, for display in pi's /resume list.
+ *  Preference: authored `sessionTitle` → first sentence of `goal` → of `summary`.
+ *  Strips leading markdown bullets/emphasis, caps to ~6 words / 48 chars. */
+function deriveSessionTitle(handoff: Handoff): string | undefined {
+	const raw =
+		(handoff.sessionTitle ?? "").trim() ||
+		firstSentence(handoff.goal) ||
+		firstSentence(handoff.summary);
+	if (!raw) return undefined;
+	const flat = raw
+		.replace(/[#>*_`~-]+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!flat) return undefined;
+	const words = flat.split(" ").slice(0, MAX_SESSION_TITLE_WORDS).join(" ");
+	if (words.length <= MAX_SESSION_TITLE_CHARS) return words;
+	return words.slice(0, MAX_SESSION_TITLE_CHARS - 1).trimEnd() + "…";
+}
+
+/** Rename the CURRENT (closing) session to a short title derived from the
+ *  handoff body, so pi's /resume list distinguishes it from siblings. Returns
+ *  the title (used to label the child session) or undefined if none could be
+ *  derived. Best-effort: a failure to write the name never blocks the handoff. */
+function nameClosingSession(pi: ExtensionAPI, handoff: Handoff): string | undefined {
+	const title = deriveSessionTitle(handoff);
+	if (title) {
+		try {
+			pi.setSessionName(title);
+		} catch {
+			// renaming is best-effort; never block the handoff
+		}
+	}
+	return title;
+}
+
+/** Start the next session, injecting the starter prompt and keeping pi alive.
+ *
+ * We send the starter prompt via sendUserMessage (auto-starts context
+ * acceptance, no extra Enter). Around ctx.newSession we arm a PERMANENT
+ * keepalive so the process does not exit during/after the replacement; the new
+ * session's first interactive keypress clears it (see the `input` handler in
+ * the default export). */
 async function startNextSession(
+	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	parentSession: string | undefined,
 	starterPrompt: string,
+	inheritedTitle: string | undefined,
 	onReady: (childSessionFile: string | undefined) => void,
 ): Promise<{ cancelled: boolean }> {
+	// Arm a PERMANENT keepalive BEFORE newSession so the interval spans the
+	// entire replacement window AND any-length context-acceptance turn. It is
+	// cleared only by the first interactive keypress in the new session (proof
+	// the REPL is reading stdin and self-sustaining). No time-based fallback:
+	// a fixed timeout races with unbounded turn durations (see the doc above).
+	handoffKeepalive = setInterval(() => {}, 2 ** 30);
 	const result = await ctx.newSession({
 		parentSession,
 		withSession: async (rctx) => {
 			try {
+				// Auto-start context acceptance — no extra Enter needed.
+				await rctx.sendUserMessage(starterPrompt);
+				onReady(rctx.sessionManager.getSessionFile() ?? undefined);
+				notify(rctx, "New session started; context acceptance running.", "info");
+			} catch {
+				// Last resort: if injection isn't available, place the prompt in the
+				// editor and let the user press Enter.
 				rctx.ui.setEditorText(starterPrompt);
 				onReady(rctx.sessionManager.getSessionFile() ?? undefined);
-				notify(rctx, "New session started. Press Enter to begin context acceptance.", "info");
-			} catch {
-				// Last resort: if the editor isn't available, queue the prompt as a
-				// follow-up message so it is at least delivered (the known exit bug
-				// is acceptable here only because nothing else worked).
-				rctx.sendUserMessage(starterPrompt, { deliverAs: "followUp" });
-				onReady(rctx.sessionManager.getSessionFile() ?? undefined);
-				notify(rctx, "New session started; context acceptance queued.", "info");
+				notify(rctx, "New session started; press Enter to begin context acceptance.", "info");
+			}
+			// Label the new session as a continuation of its parent handoff. By
+			// now rebindSession has run, so pi.setSessionName targets the NEW
+			// session. The label is replaced by this session's OWN title at the
+			// next handoff (nameClosingSession on the way out).
+			if (inheritedTitle) {
+				try {
+					pi.setSessionName(CONTINUATION_PREFIX + inheritedTitle);
+				} catch {
+					// best-effort; naming must not block context acceptance
+				}
 			}
 		},
 	});
 	if (result.cancelled) {
+		clearHandoffKeepalive();
 		notify(ctx, "New session cancelled (handoff is still on disk).", "info");
 	}
 	return { cancelled: !!result.cancelled };
@@ -441,10 +554,12 @@ export default function (pi: ExtensionAPI): void {
 					return;
 				}
 				notify(ctx, "Handoff body ready — starting the next session.", "info");
-				const committedAt = new Date().toISOString();
-				await startNextSession(ctx, parentSession, starterPrompt, (child) => {
-					markCommitted(ctx.cwd, committedAt, child);
-				});
+			const cwd = ctx.cwd;
+			const title = nameClosingSession(pi, h!);  // v.ok above implies h is defined
+			const committedAt = new Date().toISOString();
+			await startNextSession(pi, ctx, parentSession, starterPrompt, title, (child) => {
+				markCommitted(cwd, committedAt, child);  // cwd captured as a string: the old ctx is stale by the time this runs
+			});
 			} else {
 				notify(
 					ctx,
@@ -495,9 +610,11 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const parentSession = ctx.sessionManager.getSessionFile() ?? undefined;
 			const starterPrompt = buildStarterPrompt(hp, h.language);
+			const cwd = ctx.cwd;
+			const title = nameClosingSession(pi, h);
 			const committedAt = new Date().toISOString();
-			await startNextSession(ctx, parentSession, starterPrompt, (child) => {
-				markCommitted(ctx.cwd, committedAt, child);
+			await startNextSession(pi, ctx, parentSession, starterPrompt, title, (child) => {
+				markCommitted(cwd, committedAt, child);  // cwd captured as a string: the old ctx is stale by the time this runs
 			});
 		},
 	});
@@ -660,5 +777,15 @@ export default function (pi: ExtensionAPI): void {
 		if (h) {
 			notify(ctx, `Handoff available from a previous session (${h.driver}). Read it, or run /session-link-show.`, "info");
 		}
+	});
+
+	// --- clear the post-handoff keepalive on the first real keypress ------------
+	// The keepalive is armed in startNextSession (old runtime) and must survive
+	// into this new runtime; the first INTERACTIVE input proves the REPL is
+	// reading stdin and holding the event loop on its own, so the interval is no
+	// longer needed. Extension/rpc sources are ignored — they aren't proof of an
+	// interactive, self-sustaining REPL.
+	pi.on("input", (event) => {
+		if (event.source === "interactive") clearHandoffKeepalive();
 	});
 }

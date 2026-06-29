@@ -44,6 +44,7 @@ export const AGENT_BODY_FIELDS = [
 	"goal",
 	"summary",
 	"nextStep",
+	"sessionTitle",
 	"blockers",
 	"decisions",
 	"filesChanged",

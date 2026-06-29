@@ -54,6 +54,8 @@ export interface Handoff {
 	summary?: string;
 	/** Where the next session picks up / what "done" looks like here. Mandatory for a ready handoff. */
 	nextStep?: string;
+	/** Short 2–5 word label for THIS session's work, shown in pi's /resume list. Optional authored override; the code derives one from `goal` when absent. */
+	sessionTitle?: string;
 	/** Blockers and what unblocks them. */
 	blockers?: string[];
 	/** Consequential choices WITH why, so they aren't re-litigated. */
