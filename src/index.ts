@@ -14,9 +14,13 @@
  *      re-presents. Loop until satisfied — no special machinery.
  *   3. `/session-link-go` validates the mandatory spine, (optionally) warns about
  *      a fork if this handoff already started a child, then starts a new session
- *      and injects the starter prompt (a thin pointer at the handoff file).
- *      `auto` mode does steps 1→3 unattended (authoring turn, wait for idle,
- *      validate, start next session).
+ *      and places the starter prompt (a thin pointer at the handoff file) into the
+ *      new session's editor — the user presses Enter to kick off context
+ *      acceptance. (We use setEditorText, not sendUserMessage: in pi 0.80.x the
+ *      latter leaves a no-ref'ed-handles window during session replacement and
+ *      the process exits to the shell once the injected turn finishes.) `auto`
+ *      mode does steps 1→3 with the same editor-placement (so it is no longer
+ *      fully unattended — one Enter is required in the new session).
  *   4. New session: `current_session` (self-id) → read handoff (its BODY is the
  *      context) → read referenced files → report understanding → resolve any real
  *      uncertainty via the `session_link` tool (headless resume of the previous
@@ -360,7 +364,15 @@ function sendAuthorTurn(pi: ExtensionAPI, ctx: ExtensionCommandContext, prompt: 
 	}
 }
 
-/** Start the next session with the starter prompt injected. Shared by auto + go. */
+/** Start the next session with the starter prompt placed in its editor.
+ *
+ * Why setEditorText instead of sendUserMessage: in pi 0.80.x, injecting the
+ * starter prompt via `sendUserMessage` inside `withSession` leaves a window
+ * during session replacement where Node has no ref'ed handles, so once the
+ * injected turn finishes the process exits to the shell (clean exit, code 0,
+ * empty stderr) instead of staying interactive. Putting the prompt in the
+ * editor lets the REPL enter its normal input loop (which holds stdin) and
+ * stay alive; the user presses Enter to kick off context acceptance. */
 async function startNextSession(
 	ctx: ExtensionCommandContext,
 	parentSession: string | undefined,
@@ -371,13 +383,16 @@ async function startNextSession(
 		parentSession,
 		withSession: async (rctx) => {
 			try {
-				await rctx.sendUserMessage(starterPrompt);
-				onReady(rctx.sessionManager.getSessionFile() ?? undefined);
-				notify(rctx, "New session started; context acceptance is running.", "info");
-			} catch {
 				rctx.ui.setEditorText(starterPrompt);
 				onReady(rctx.sessionManager.getSessionFile() ?? undefined);
-				notify(rctx, "New session started; submit the editor to begin context acceptance.", "info");
+				notify(rctx, "New session started. Press Enter to begin context acceptance.", "info");
+			} catch {
+				// Last resort: if the editor isn't available, queue the prompt as a
+				// follow-up message so it is at least delivered (the known exit bug
+				// is acceptable here only because nothing else worked).
+				rctx.sendUserMessage(starterPrompt, { deliverAs: "followUp" });
+				onReady(rctx.sessionManager.getSessionFile() ?? undefined);
+				notify(rctx, "New session started; context acceptance queued.", "info");
 			}
 		},
 	});

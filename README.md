@@ -69,15 +69,17 @@ session is on its own. `session-link` adds two things:
   (a failed authoring pass never wipes a good summary). A handoff from a
   **different** session archives the old one and advances the chain. This also
   fixes a self-link bug where `parentHandoffPath` used to point at the live file.
-- **`auto` mode** keeps doing the whole pipeline unattended (authoring turn →
-  wait → validate → start next session) for hands-off handoffs.
+- **`auto` mode** keeps doing the whole pipeline authoring → wait → validate
+  → start next session, but the new session opens with the starter prompt in the
+  editor (one Enter is required there). See the note below on why the prompt is
+  placed in the editor rather than auto-submitted.
 - Backwards chain (`parentHandoffPath`), **language preservation**, and the
   **portable driver model** (pi / claude-code / qwen) are unchanged.
 
 
 ## What it gives you
 
-- **`/session-link [auto|manual] [lang=<ru|en|Russian|…>] [note]`** (TUI only) — write the handoff envelope **and** run the authoring turn in the closing session. In `manual` (default) the agent fills the body and asks for review; in `auto` it then validates and starts the next session unattended. The detected conversation language is shown in the notify (override it with `lang=…`, or `SESSION_LINK_LANGUAGE`).
+- **`/session-link [auto|manual] [lang=<ru|en|Russian|…>] [note]`** (TUI only) — write the handoff envelope **and** run the authoring turn in the closing session. In `manual` (default) the agent fills the body and asks for review; in `auto` it then validates and starts the next session. The detected conversation language is shown in the notify (override it with `lang=…`, or `SESSION_LINK_LANGUAGE`). In both modes the next session opens with the starter prompt already in the editor — press **Enter** there to begin context acceptance. (Auto-submitting via `sendUserMessage` hits a pi 0.80.x bug where the process exits to the shell once the injected turn finishes, so the prompt is placed in the editor instead and the REPL stays alive.)
   envelope **and** run the authoring turn in the closing session. In `manual`
   (default) the agent fills the body and asks for review; in `auto` it then
   validates and starts the next session unattended.
