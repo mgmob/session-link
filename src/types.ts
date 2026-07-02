@@ -44,7 +44,7 @@ export interface Handoff {
 	model?: string;
 	/** Human + machine readable one-shot invocation (for manual fallback / debugging). */
 	howToAsk: string;
-	/** Argv template. The element "{QUESTION}" is replaced with the wrapped question at runtime. No shell, no injection. */
+	/** Argv for the headless resume (no shell, no injection). The QUESTION TEXT is delivered via STDIN at runtime, not as an argv element — a newline in an argv element is truncated by cmd.exe on Windows (issue-6). Any legacy `{QUESTION}` element is filtered out at spawn time. The `howToAsk` field shows the stdin piping form for a manual fallback. */
 	askCommand: string[];
 
 	// ── BODY (agent-authored) ────────────────────────────────────────────────

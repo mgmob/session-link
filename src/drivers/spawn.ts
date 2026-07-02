@@ -6,10 +6,11 @@ import * as path from "node:path";
  * Spawn a binary by name (e.g. "pi"), resolving PATH + PATHEXT ourselves on
  * Windows so the global npm shim (`pi.cmd`) is found WITHOUT a shell.
  *
- * Why no shell: the headless resume argv carries `{QUESTION}`, which is an
- * arbitrary, user-authored string. With a shell it would be interpolated into a
- * command line and re-interpreted (injection). Instead we resolve the absolute
- * path of the binary ourselves and pass every argument as a real argv element.
+ * Why no shell: the headless resume argv may carry user-derived values (e.g.
+ * a session path). With a shell they would be interpolated into a command line
+ * and re-interpreted (injection). Instead we resolve the absolute path of the
+ * binary ourselves and pass every argument as a real argv element. (The wrapped
+ * QUESTION itself is delivered via STDIN, not argv — see drivers/index.ts.)
  *
  * On Windows a `.cmd`/`.bat` shim still has to run through `cmd.exe`, so we
  * reproduce cross-spawn's verbatim-argument escaping (based on

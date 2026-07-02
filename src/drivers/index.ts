@@ -25,10 +25,20 @@ interface Captured {
 function runCapture(
 	cmd: string,
 	args: string[],
-	opts: { cwd: string; timeoutMs: number; signal?: AbortSignal },
+	opts: { cwd: string; timeoutMs: number; signal?: AbortSignal; input?: string },
 ): Promise<Captured> {
 	return new Promise((resolve, reject) => {
-		const child = spawnBin(cmd, args, { cwd: opts.cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+		// stdin is a pipe only when we have input to feed (the wrapped question).
+		// Otherwise leave it ignored so pi doesn't block waiting for a prompt.
+		const stdio: ("pipe" | "ignore")[] = [opts.input !== undefined ? "pipe" : "ignore", "pipe", "pipe"];
+		const child = spawnBin(cmd, args, { cwd: opts.cwd, env: process.env, stdio });
+		if (opts.input !== undefined && child.stdin) {
+			try {
+				child.stdin.end(opts.input);
+			} catch {
+				// EPIPE if the child died before reading; the close handler reports it.
+			}
+		}
 		let stdout = "";
 		let stderr = "";
 		let settled = false;
@@ -121,14 +131,19 @@ function killChild(child: ChildProcess) {
 	}, 2000);
 }
 
-/** Build the argv to resume + query the previous session headlessly. */
-function buildArgv(handoff: Handoff, wrappedQuestion: string): string[] {
-	const tpl = handoff.askCommand && handoff.askCommand.length > 0
-		? handoff.askCommand
-		: ["pi", "--mode", "json", handoff.sessionRef ? "--session" : "", handoff.sessionRef, QUESTION_PLACEHOLDER].filter(
-				Boolean,
-			);
-	return tpl.map((a) => (a === QUESTION_PLACEHOLDER ? wrappedQuestion : a));
+/** Build the argv to resume the linked session headlessly. The QUESTION TEXT is
+ *  delivered via STDIN (see querySession), never as an argv element: a newline
+ *  in an argv element is truncated at the first \n by cmd.exe on Windows (the
+ *  global `pi` shim is a .cmd), which silently dropped the actual question
+ *  while the single-line wrapper prefix survived (issue-6). stdin preserves
+ *  newlines and any length on every platform. Any legacy `{QUESTION}` element
+ *  in askCommand is filtered out here for backward compatibility. */
+function buildArgv(handoff: Handoff): string[] {
+	const tpl =
+		handoff.askCommand && handoff.askCommand.length > 0
+			? handoff.askCommand
+			: ["pi", "--mode", "json", handoff.sessionRef ? "--session" : "", handoff.sessionRef].filter(Boolean);
+	return tpl.filter((a) => a !== QUESTION_PLACEHOLDER);
 }
 
 function parseOutput(driver: DriverName, raw: string): string {
@@ -139,7 +154,7 @@ function parseOutput(driver: DriverName, raw: string): string {
 /** Run a full query round against the linked session. */
 export async function querySession(req: AskRequest): Promise<AskResult> {
 	const wrapped = wrapQuestion(req.question, req.clarifications, req.handoff.language);
-	const argv = buildArgv(req.handoff, wrapped);
+	const argv = buildArgv(req.handoff);
 	const cmd = argv[0];
 	const args = argv.slice(1);
 
@@ -147,6 +162,7 @@ export async function querySession(req: AskRequest): Promise<AskResult> {
 		cwd: req.handoff.cwd || process.cwd(),
 		timeoutMs: req.timeoutMs,
 		signal: req.signal,
+		input: wrapped,
 	});
 
 	const text = parseOutput(req.handoff.driver, captured.stdout);

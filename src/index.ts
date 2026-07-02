@@ -213,8 +213,11 @@ function buildAskCommand(absSessionFile: string | undefined, model: string | und
 	if (absSessionFile) argv.push("--session", absSessionFile);
 	argv.push("--tools", PI_TOOLS_ALLOWLIST); // read-only + excludes our own tools → no recursion, no mutation
 	if (model) argv.push("--model", model);
-	argv.push("{QUESTION}");
-	const human = argv.join(" ").replace("{QUESTION}", '"<your question>"');
+	// The wrapped question is fed via STDIN at runtime, not as an argv element:
+	// a newline in an argv element is truncated by cmd.exe on Windows (the global
+	// `pi` shim is a .cmd), which silently dropped the question (issue-6). The
+	// human-readable form below shows the piping so the manual fallback works.
+	const human = `printf '%s' "<your question>" | ${argv.join(" ")}`;
 	return { argv, human };
 }
 
