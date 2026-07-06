@@ -3,6 +3,8 @@
 A [pi](https://pi.dev) extension that **links sessions** via a context handoff
 with a back-channel.
 
+> **TL;DR на пальцах (по-русски):** см. [ОБЗОР.md](ОБЗОР.md) — что это, зачем и как работает простыми словами.
+
 A normal handoff is one-way: the closing session drops a file and the next
 session is on its own. `session-link` adds two things:
 
@@ -48,7 +50,8 @@ session is on its own. `session-link` adds two things:
   - **Mandatory spine**: `goal`, `summary`, `nextStep`. A handoff is "ready" to
     hand off only when the spine is filled (`/session-link-go` validates it).
   - **Optional fields**: `blockers`, `decisions` (with rationale),
-    `filesChanged`, `filesToRead`, `environment`, `deliberatelySkipped`.
+    `filesChanged`, `filesToRead`, `environment`, `deliberatelySkipped`,
+    `sessionTitle` (a short label for this session, shown in pi's `/resume` list).
   - **Free-form `sections`**: the agent owns the section titles, so the same
     schema fits coding, debugging, research, writing, … (e.g. *"Hypotheses ruled
     out"*, *"Sources consulted"*, *"Tests"*).
@@ -69,25 +72,36 @@ session is on its own. `session-link` adds two things:
   (a failed authoring pass never wipes a good summary). A handoff from a
   **different** session archives the old one and advances the chain. This also
   fixes a self-link bug where `parentHandoffPath` used to point at the live file.
-- **`auto` mode** keeps doing the whole pipeline authoring → wait → validate
-  → start next session, but the new session opens with the starter prompt in the
-  editor (one Enter is required there). See the note below on why the prompt is
-  placed in the editor rather than auto-submitted.
+- **Auto-submit is back.** The next session now starts with the starter prompt
+  **injected via `sendUserMessage`** — context acceptance begins immediately, no
+  extra Enter. A process-level keepalive (the same `setInterval` trick pi itself
+  uses in `handleCtrlZ`) holds the REPL alive across session replacement and is
+  cleared only by the first real keypress in the new session. (A prior version
+  placed the prompt in the editor as a workaround for a pi 0.80.x exit bug; if
+  injection isn't available it still falls back to that.)
+- **Session titles.** On handoff the closing session is renamed to a short label
+  derived from `goal` (or an authored `sessionTitle`), and the new session is
+  initially labelled `→ <title>` until it earns its own title at the next
+  handoff — so pi's `/resume` list reads as a chain instead of indistinguishable
+  rows.
 - Backwards chain (`parentHandoffPath`), **language preservation**, and the
   **portable driver model** (pi / claude-code / qwen) are unchanged.
 
 
 ## What it gives you
 
-- **`/session-link [auto|manual] [lang=<ru|en|Russian|…>] [note]`** (TUI only) — write the handoff envelope **and** run the authoring turn in the closing session. In `manual` (default) the agent fills the body and asks for review; in `auto` it then validates and starts the next session. The detected conversation language is shown in the notify (override it with `lang=…`, or `SESSION_LINK_LANGUAGE`). In both modes the next session opens with the starter prompt already in the editor — press **Enter** there to begin context acceptance. (Auto-submitting via `sendUserMessage` hits a pi 0.80.x bug where the process exits to the shell once the injected turn finishes, so the prompt is placed in the editor instead and the REPL stays alive.)
-  envelope **and** run the authoring turn in the closing session. In `manual`
-  (default) the agent fills the body and asks for review; in `auto` it then
-  validates and starts the next session unattended.
+- **`/session-link [auto|manual] [lang=<ru|en|Russian|…>] [note]`** (TUI only) —
+  write the handoff envelope **and** run the authoring turn in the closing
+  session. In `manual` (default) the agent fills the body and asks for review; in
+  `auto` it then validates the spine and starts the next session unattended. The
+  detected conversation language is shown in the notify (override it with
+  `lang=…`, or `SESSION_LINK_LANGUAGE`). The next session starts with the starter
+  prompt injected — context acceptance begins immediately.
 - **`/session-link-go`** (TUI only) — start the next session from the current
   handoff. Validates the spine first; warns on a fork. Use it after reviewing.
-- **`/session-link-write [lang=<…>] [note]`** (TUI only) — write the envelope + authoring turn, without starting the next session (open the next session yourself, or run `/session-link-go` later).
-  turn, without starting the next session (open the next session yourself, or
-  run `/session-link-go` later).
+- **`/session-link-write [lang=<…>] [note]`** (TUI only) — write the envelope +
+  authoring turn, without starting the next session (open the next session
+  yourself, or run `/session-link-go` later).
 - **`/session-link-show`** (any mode) — print the current handoff's path and
   spine status (`ready` / `DRAFT`).
 - **`session_link` tool** — the LLM in the next session calls this to query a
@@ -112,7 +126,7 @@ The handoff has two zones:
 - **Body** (owned by the closing agent):
   - `goal`, `summary`, `nextStep` — mandatory spine.
   - `blockers`, `decisions` (`{decision, rationale}[]`), `filesChanged`,
-    `filesToRead`, `environment`, `deliberatelySkipped` — optional.
+    `filesToRead`, `environment`, `deliberatelySkipped`, `sessionTitle` — optional.
   - `sections` (`{title, body, files?}[]`) — optional, free-form; the agent
     chooses the titles to fit the task.
 
@@ -123,15 +137,20 @@ The schema is described to the agent **inside the authoring prompt**, and
 
 ## How the back-channel works (and why it's portable)
 
-The handoff records an **`askCommand`** — an argv template with a `{QUESTION}`
-placeholder — that the *closing* side authors (it knows its own platform's
-flags). The next session just substitutes the question and runs it; no guessing.
+The handoff records an **`askCommand`** — an argv that resumes the previous
+session headlessly — which the *closing* side authors (it knows its own
+platform's flags). The next session feeds the **question via STDIN**, not on the
+command line: a newline in an argv element is truncated by `cmd.exe` on Windows
+(the global `pi` shim is a `.cmd`), which used to silently drop the question
+(issue-6). Any legacy `{QUESTION}` element in `askCommand` is filtered out at
+spawn time; the driver parses the resulting stdout. `howToAsk` shows the
+`printf '%s' "<question>" | …` form for a manual fallback.
 
 The **`driver`** field only selects the **output parser**:
 
 | driver | headless invocation (example) | output parsed as |
 | --- | --- | --- |
-| `pi` | `pi --mode json --session <file> --tools read,grep,find,ls [--model provider/id] "{QUESTION}"` | JSONL events → last assistant text |
+| `pi` | `printf '%s' "<question>" \| pi --mode json --session <file> --tools read,grep,find,ls [--model provider/id]` | JSONL events → last assistant text |
 | `claude-code` | `claude -p "{QUESTION}" --resume <id> --output-format json` | `{result: "..."}` |
 | `qwen` | (verify flags for your `qwen` version; encode in `askCommand`) | plain text |
 
@@ -231,9 +250,9 @@ new branch. Nothing in the chain is corrupted.
   `SESSION_LINK_PI_TOOLS` if you trust it to investigate.
 - **Windows**: works. The headless resume resolves PATH and `PATHEXT` itself (so
   `pi` finds `pi.cmd`) and runs a `.cmd`/`.bat` shim through `cmd.exe` with
-  verbatim-escaped arguments — `{QUESTION}` is passed as a real argv element,
-  never interpolated into a shell string. This is self-contained: there are no
-  runtime `dependencies` (only `peerDependencies` provided by pi), so the package
-  loads from a git cache with no `node_modules`. If you still see an `ENOENT`
-  from `session_link`, the binary isn't on PATH for that process; point
+  verbatim-escaped arguments; the question is fed via STDIN, never interpolated
+  into a shell string. This is self-contained: there are no runtime
+  `dependencies` (only `peerDependencies` provided by pi), so the package loads
+  from a git cache with no `node_modules`. If you still see an `ENOENT` from
+  `session_link`, the binary isn't on PATH for that process; point
   `SESSION_LINK_PI_BIN` at the absolute `pi.cmd` (find it with `where pi`).
