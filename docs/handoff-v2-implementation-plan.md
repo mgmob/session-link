@@ -41,9 +41,9 @@
 
 Реализационные (в рамках контракта, подтверждены; если заказчик зафиксирует в контракте — обновить):
 1. **Коллизия `id`** (совпадение ms + 4 hex при параллельной записи): `generateId` проверяет существование `handoff-<id>.json` в store и регенерирует hex до уникальности.
-2. **Миграция v1→v2 (минимальная):** `id` присваивается голове (она становится архивом `handoff-<id>.json`); более глубокие v1-предки остаются v1 и разрешаются по `parentHandoffPath` (§2.5 шаг 4). Всю цепочку в v2 не переписываем.
+2. **Миграция v1→v2 (минимальная):** переносится **только голова** — получает `unit` (§3.2) и `id` (§2.5), конвертируется в v2 и ложится в `<store>/<unit>/`. **Архивы v1 остаются на старом месте** (у них нет `id`, перенос обнулил бы их `parentHandoffPath`-ссылки в потомках); разрешаются шагом 4 §2.5. Всю цепочку в v2 не переписываем; полная консолидация старых звеньев — отдельная операция обслуживания, не MVP.
 3. **`parent`/`parentHandoffPath` при redo-in-place:** переносятся как есть (предок тот же); `derived` при этом пересобирается.
-4. **Нумерация инвариантов** в контракте сбита (15–16 после 22) — косметика, на реализацию не влияет; номера в §4 здесь — по контракту.
+4. **Порядок инвариантов** в контракте исправлен (15–16 до 17); добавлен инвариант 23 (миграция не рвёт связь с v1-предками). Карта §4 здесь синхронизирована.
 
 ## 3. Этапы
 
@@ -61,7 +61,7 @@
 
 ### Э1 — Типы v2 + `resolveStore` + `generateId` → Э0
 **Файлы:** `src/types.ts`, `src/store.ts` (новый), `tests/store.test.ts`.
-- `types.ts`: `Handoff` → v2 (все поля v1 сохранены; добавлены `id: string`, `parent?: ParentRef`, `unit: string`, `unitProvisional?: boolean`, `seq: number`, `lineState?: "active"|"done"|"abandoned"`, `derived?: DerivedFacts`, `targetCwd?: string`, `externals?: Record<string, unknown>`). `schema` — `"session-link/handoff/v2"` (v1 оставить как отдельный литерал/union для приёмника). `ParentRef = { id: string; unit?: string; seq?: number; store?: string }`. `DerivedFacts = { branch?, commits?, filesChanged?, startedAt?, endedAt?, checks? }`.
+- `types.ts`: `Handoff` → v2 (все поля v1 сохранены; добавлены `id: string`, `parent?: ParentRef`, `unit: string`, `unitProvisional?: boolean`, `seq: number`, `lineState?: "active"|"done"|"abandoned"`, `derived?: DerivedFacts`, `targetCwd?: string`, `externals?: Record<string, unknown>`). `schema` — `"session-link/handoff/v2"` (v1 оставить как отдельный литерал/union для приёмника). `ParentRef = { id: string; unit?: string; seq?: number; store?: string }`. `DerivedFacts = { baseRef?, branch?, commits?, filesChanged?, startedAt?, endedAt?, checks? }`.
 - `store.ts`:
   - `resolveStore(cwd): { root: string; viaGit: boolean }` — `git rev-parse --git-common-dir` (абсолютизировать; git недоступен/не репо → fallback `<cwd>/.pi/session_link`).
   - `generateId(storeRoot): string` — `<YYYYMMDD>T<HHMMSSmmm>-<4hex>` (crypto), проверка коллизии по `readdir` архивов и существующих голов, регенерация hex.
@@ -95,13 +95,14 @@
 ### Э4 — Миграция v1→v2 (§2.4) → Э1, Э3
 **Файлы:** `src/handoff.ts`, `src/store.ts`, `tests/migrate.test.ts`.
 - При первой записи (детект: legacy-голова найдена по шагу 3 `findHandoff`, а пишем в `<store>/<unit>/`):
-  1. legacy-голове присваивается `unit` (по §3.2) и `id` (`generateId`);
-  2. перенос головы и её архивов `<cwd>/.pi/session_link/*` → `<store>/<unit>/` (**move**, не copy);
-  3. в старом каталоге остаётся однострочный `MOVED-TO.txt` с абсолютным путём нового места;
-  4. запись v2 идёт по новому пути; `parent` нового звена ссылается на бывшую голову по `id`.
+  1. legacy-голове присваивается `unit` (§3.2) и `id` (§2.5);
+  2. **переносится только голова** (`handoff.json` + проекция `handoff.md`) из `<cwd>/.pi/session_link` в `<store>/<unit>/`, где конвертируется в обычное звено v2 и (при записи нового звена) архивируется как `handoff-<id>.json`;
+  3. **архивы v1 остаются на старом месте** — у них нет `id`, и перенос обнулил бы абсолютные `parentHandoffPath` в потомках, порвав цепочку в точке миграции; разрешаются шагом 4 §2.5;
+  4. в старом каталоге остаётся однострочный `MOVED-TO.txt` с абсолютным путём нового места;
+  5. запись v2 идёт по новому пути; `parent` нового звена ссылается на мигрированную голову по `id`, а та — на v1-предка по `parentHandoffPath`.
 - Столкновений не возникает (§2.4): каждая legacy-цепочка получает своё имя. Машинерия развилок (§6) **не** привлекается.
 - v1-предки глубже головы остаются v1 (`parentHandoffPath`).
-**Инварианты:** 7, 14 (legacy найден, перенесён однократно, маркер; повтор — не находит старую голову), 19 (две legacy из разных worktree → две разные линии).
+**Инварианты:** 7, 14 (legacy найден, перенесён однократно, маркер; повтор — не находит старую голову), 19 (две legacy из разных worktree → две разные линии), 23 (после переноса головы обход к v1-предкам возвращает те же звенья — архивы на месте).
 **Готовность:** фикстура v1 после первой записи → v2 на новом месте, `MOVED-TO.txt` на старом, повторный поиск не падает.
 
 ### Э5 — Транзакция и блокировка (§5) → Э1
@@ -122,8 +123,9 @@
   - **новое звено** (голова есть, `sessionId` другой): голова → архив `handoff-<id>.json`, `parent` = `{id, unit, seq, store?}`, `seq` = `seq(головы)+1`.
   - **первое звено** (головы нет): `seq` = 1, `parent` отсутствует.
 - `seq`-арифметика §7.2; производная линия при ветвлении от N → `N+1` (но сами развилки — Э8).
-- `collectDerived(cwd)`: `branch` (`git rev-parse --abbrev-ref HEAD`), `commits` (если определимо), `filesChanged` (из `git`), `startedAt`/`endedAt`. **`checks` не собираем** (MVP). Всё best-effort: git недоступен → поля опущены, запись не падает.
+- `collectDerived(cwd, baseRef?)`: `branch` (`git rev-parse --abbrev-ref HEAD`), `commits` (`baseRef..HEAD`), `filesChanged` (`diff baseRef..HEAD` + рабочее дерево), `startedAt`/`endedAt`, `baseRef`. **`baseRef` обязателен для `commits`/`filesChanged`** — иначе пришлось бы угадывать базовую ревизию (тот же запрет, что для `checks`); нет `baseRef` → оба поля опускаются, не заполняются приблизительно. **`checks` не собираем** (MVP). Всё best-effort: git недоступен → поля опущены, запись не падает.
 - `mergeAgentBody` адаптировать: при redo переносить авторские поля, но НЕ `derived` (он свежий).
+- Обновить `toMarkdown` (проекция `handoff.md`, §7.1): имя линии + `seq`; **заметная пометка `unitProvisional` с подсказкой `/session-link-name`** (иначе провизорные имена не переименует никто никогда); блок фактов из `derived`. Проекцию читает оператор, решения — по ней.
 **Инварианты:** 1 (unit переживает смену сессии/модели), 2 (две линии не смешиваются), 15 (умершая до авторства → `derived` заполнен, DRAFT), 16 (провал сессии не закрывает линию → `lineState` `active`), 17 (redo не плодит звенья, не стирает авторское).
 **Готовность:** три случая покрыты; `summary` переживает пустую попытку авторства; `derived` у DRAFT.
 
@@ -172,6 +174,7 @@
 ### Э12 — Старт-флоу и авторство v2 → Э6, Э8
 **Файлы:** `src/index.ts` (`buildEnvelope`, `buildStarterPrompt`, `buildAuthorPrompt`).
 - `buildEnvelope`: v2-конверт — `id` (`generateId`), `unit` (по §3.2), `parent` (из головы/`parent.id`), `seq`, `store`-поля, `derived` (fresh), `targetCwd`/`externals` если есть. `schema = "session-link/handoff/v2"`.
+- **Фиксировать `baseRef` при старте сессии** (`session_start`: `git rev-parse HEAD`) и передавать в `collectDerived` (Э6). Без `baseRef` `commits`/`filesChanged` не заполняются (контракт §7.3) — угадывать базовую ревизию запрещено тем же правилом, что и `checks`.
 - `buildAuthorPrompt`: обновить схему для агента — `id`/`parent`/`derived`/`seq`/`unitProvisional` агенту **трогать нельзя** (зона кода); `unitProvisional` → подсказка «назови линию `/session-link-name`»; авторские поля прежние + напоминание «факты собираются, смысл пишется».
 - `buildStarterPrompt`: путь к голове + инструкция читать тело/`derived`; при `unitProvisional` — напомнить переименовать.
 - Интеграция с keepalive/session-titles — сохранить (поведение не меняется).
@@ -211,6 +214,7 @@
 | 20 | после `/session-link-name` архивы побайтово те же; производная разрешает предка | Э8 |
 | 21 | предок мигрировал; потомок в другом store разрешает через `parent.store`+`MOVED-TO` | Э3 |
 | 22 | битая ссылка → отказ с `id` и последним путём | Э3 |
+| 23 | после переноса головы обход к v1-предкам возвращает те же звенья (архивы v1 на месте, по `parentHandoffPath`) | Э4 |
 
 ## 5. Риски и edge cases
 
