@@ -1,12 +1,19 @@
 /**
  * Shared types for session-link.
  *
- * The handoff is a small JSON document with two zones:
- *   - ENVELOPE (owner = code): who to talk to + how to resume it headlessly.
- *     Fields like sessionRef / askCommand / driver / model / cwd / timestamps are
- *     written by buildHandoff; the agent must never author them.
- *   - BODY (owner = the closing agent): what was actually done and decided.
- *     goal/summary/nextStep form the mandatory "spine"; the rest are optional.
+ * The handoff is a small JSON document. In v2 it splits into THREE zones
+ * (contract §7.1) instead of the v1 two:
+ *   - ENVELOPE (owner = code): who to talk to + how to resume it headlessly,
+ *     plus the v2 identity fields (id / parent / unit / seq / …). The agent
+ *     must never author these.
+ *   - DERIVED (owner = code): facts collected by the tool (branch, commits,
+ *     filesChanged, timings, …). "Facts are collected, meaning is written."
+ *   - BODY (owner = the closing agent): meaning — goal/summary/nextStep form
+ *     the mandatory "spine"; the rest are optional.
+ *
+ * The reader accepts the WHOLE family {v1, v2} (§7.4): `Handoff` is therefore a
+ * union. `HandoffCommon` carries the fields present in every version so callers
+ * that only touch common fields stay union-safe without narrowing.
  *
  * `driver` only selects the OUTPUT PARSER (how the raw stdout of the headless
  * run is turned into text). The invocation itself lives in askCommand, so adding
@@ -17,6 +24,10 @@ export type DriverName = "pi" | "claude-code" | "qwen";
 
 /** How /session-link starts the next session: review-first, or unattended. */
 export type StartMode = "auto" | "manual";
+
+/** Line lifecycle (contract §4). The source of truth is the HEAD's field;
+ *  index.json only mirrors it. A failed session never closes the line. */
+export type LineState = "active" | "done" | "abandoned";
 
 export interface HandoffDecision {
 	decision: string;
@@ -31,8 +42,12 @@ export interface HandoffSection {
 	files?: string[];
 }
 
-export interface Handoff {
-	schema: "session-link/handoff/v1";
+/**
+ * Fields shared by every handoff version. Kept as a base so callers that only
+ * need common fields (most of handoff.ts / index.ts) remain union-safe.
+ * `schema` is deliberately NOT here — it's the version discriminator.
+ */
+export interface HandoffCommon {
 	createdAt: string;
 	/** Selects the output parser for the headless run. */
 	driver: DriverName;
@@ -60,7 +75,7 @@ export interface Handoff {
 	blockers?: string[];
 	/** Consequential choices WITH why, so they aren't re-litigated. */
 	decisions?: HandoffDecision[];
-	/** Paths created/edited this session. */
+	/** Paths created/edited this session (author's complement to derived.filesChanged — for what git can't see). */
 	filesChanged?: string[];
 	/** Paths the next session MUST read to be productive. */
 	filesToRead?: string[];
@@ -82,10 +97,93 @@ export interface Handoff {
 	committedAt?: string;
 	/** Session file of the last child started from this handoff. */
 	committedSessionFile?: string;
-	/** Previous handoff in a chain (always an immutable archive path, never the live handoff.json). */
+	/** Previous handoff in a chain. In v1 — an absolute archive path (the only link). In v2 — demoted to a HINT: the source of truth is `parent.id` (§2.5), this is kept for v1 chains and as a last resort. Never points at a live handoff.json. */
 	parentHandoffPath?: string;
 	/** Conversation language to carry into the next session (e.g. "Russian"). Auto-detected or set via SESSION_LINK_LANGUAGE. */
 	language?: string;
+}
+
+/** v1 handoff — the legacy shape still written/read by v0.1.0. */
+export interface HandoffV1 extends HandoffCommon {
+	schema: "session-link/handoff/v1";
+}
+
+/**
+ * Structural ancestor reference (contract §2.5). Identity, not location:
+ * `id` is immutable and is the source of truth; `unit`/`seq` are hints for a
+ * one-shot FS hit; `store` is set only when the ancestor lives in ANOTHER store.
+ */
+export interface ParentRef {
+	id: string;
+	/** Hint — which <unit>/ dir to look in first (one FS hop). */
+	unit?: string;
+	/** For diagnostics / sanity check. */
+	seq?: number;
+	/** Absolute path to a DIFFERENT store; only for cross-store chains. */
+	store?: string;
+}
+
+/** A single check result reserved in `derived` (NOT collected in MVP — §7.3). */
+export interface DerivedCheck {
+	name: string;
+	ok: boolean;
+	detail?: string;
+}
+
+/** Facts collected by the tool (contract §7.3). Best-effort: missing ⇒ omitted,
+ *  the write never fails on collection. `baseRef` gates commits/filesChanged. */
+export interface DerivedFacts {
+	/** HEAD at session start — the base for commits/filesChanged. Absent ⇒ both omitted. */
+	baseRef?: string;
+	branch?: string;
+	/** baseRef..HEAD */
+	commits?: string[];
+	/** diff baseRef..HEAD + working tree */
+	filesChanged?: string[];
+	startedAt?: string;
+	endedAt?: string;
+	/** Reserved — not populated until a declarative source exists (§7.3). */
+	checks?: DerivedCheck[];
+}
+
+/**
+ * v2 handoff (contract §7.2). Adds identity/line/derived fields on top of the
+ * common envelope+body. `id`, `unit`, `seq` are required — every v2 record has
+ * them (unnamed lines do not exist in v2, §3.2).
+ */
+export interface HandoffV2 extends HandoffCommon {
+	schema: "session-link/handoff/v2";
+	/** Immutable link id (§2.5): <YYYYMMDD>T<HHMMSSmmm>-<4hex>. Set on first write, never changes. */
+	id: string;
+	/** Structural ancestor reference. Absent on the first link of a line. */
+	parent?: ParentRef;
+	/** Line name (§3). Operator-given, inherited from parent, or technical (u-…). Never derived from the folder name. */
+	unit: string;
+	/** Name is technical and unconfirmed; cleared by /session-link-name. */
+	unitProvisional?: boolean;
+	/** Link number in the line. New link = seq(head)+1; redo-in-place keeps it; a fork from N starts at N+1. */
+	seq: number;
+	/** Line state — source of truth for index.json. Absent ⇒ active. */
+	lineState?: LineState;
+	/** Facts collected by code. The agent must not author or edit these. */
+	derived?: DerivedFacts;
+	/** Where the successor should start. Absent ⇒ = cwd. */
+	targetCwd?: string;
+	/** Opaque external blocks (§8). The tool stores/pass-through only — never writes or interprets. */
+	externals?: Record<string, unknown>;
+}
+
+/** Any handoff the reader accepts (family {v1, v2}, §7.4). */
+export type Handoff = HandoffV1 | HandoffV2;
+
+/** Narrow a read handoff to v2, or undefined. */
+export function isHandoffV2(h: Handoff): h is HandoffV2 {
+	return h.schema === "session-link/handoff/v2";
+}
+
+/** Narrow a read handoff to v1, or undefined. */
+export function isHandoffV1(h: Handoff): h is HandoffV1 {
+	return h.schema === "session-link/handoff/v1";
 }
 
 export interface AskRequest {
@@ -111,4 +209,3 @@ export interface SessionDriver {
 	/** Parse raw stdout from a headless run into the previous session's textual reply. */
 	parseOutput(raw: string): string;
 }
-
