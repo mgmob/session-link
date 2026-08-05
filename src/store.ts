@@ -18,6 +18,7 @@ import * as cp from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { DerivedFacts } from "./types.ts";
 
 /** Store tail, relative to the chosen root (git-common-dir or cwd). */
 export const STORE_SUBDIR = path.join(".pi", "session_link");
@@ -245,6 +246,47 @@ export function movedToPath(oldDir: string): string {
 export function incomingPath(targetStoreRoot: string, unit: string): string {
 	return path.join(targetStoreRoot, "incoming", `${unit}.json`);
 }
+
+// ── Derived facts (§7.3) ───────────────────────────────────────────────────
+// Best-effort git collection: any failure (not a repo, git missing) just omits
+// the field — collecting facts MUST NOT fail the write. `baseRef` gates
+// commits/filesChanged: without a base point they'd be guessed, which is the
+// same thing forbidden for `checks`. `checks` itself is NOT collected in MVP.
+
+/** Collect derived facts for the current session (§7.3). Pure read, never throws. */
+export function collectDerived(cwd: string, baseRef?: string, startedAt?: string): DerivedFacts {
+	const facts: DerivedFacts = {};
+	if (startedAt) facts.startedAt = startedAt;
+	facts.endedAt = new Date().toISOString();
+	const branch = gitOut(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+	if (branch) facts.branch = branch;
+	if (baseRef) {
+		facts.baseRef = baseRef;
+		const commits = gitOut(cwd, ["rev-list", `${baseRef}..HEAD`]);
+		if (commits) facts.commits = commits.trim().split("\n").filter(Boolean);
+		// committed deltas + the uncommitted working tree (what git doesn't see yet).
+		const changed = gitOut(cwd, ["diff", "--name-only", `${baseRef}..HEAD`]);
+		const dirty = gitOut(cwd, ["status", "--porcelain", "--untracked-files=all"]);
+		const files = new Set<string>();
+		if (changed) for (const f of changed.trim().split("\n")) if (f) files.add(f);
+		if (dirty) for (const line of dirty.trim().split("\n")) { const f = line.slice(3); if (f) files.add(f); }
+		if (files.size) facts.filesChanged = [...files].sort();
+	}
+	return facts;
+}
+
+/** Run git and return stdout (trimmed), or undefined on ANY failure. */
+function gitOut(cwd: string, args: string[]): string | undefined {
+	let out: cp.SpawnSyncReturns<string>;
+	try {
+		out = cp.spawnSync("git", args, { cwd, encoding: "utf-8" });
+	} catch {
+		return undefined;
+	}
+	if (out.status !== 0 || out.error) return undefined;
+	return (out.stdout || "").trim() || undefined;
+}
+
 
 // ── Lock (§5) ──────────────────────────────────────────────────────────────
 // Store-wide: index.json is the single contention point, so per-unit granularity

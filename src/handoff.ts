@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Handoff, HandoffV1, HandoffV2, LineState } from "./types.ts";
-import { assignUnit, generateId, headMdPath, headPath, indexPath, movedToPath, resolveStore, unitDir, UNIT_PATTERN } from "./store.ts";
+import type { DerivedFacts, Handoff, HandoffV1, HandoffV2, LineState, ParentRef } from "./types.ts";
+import type { WithLockOptions } from "./store.ts";
+import { archivePath, assignUnit, collectDerived, generateId, headMdPath, headPath, indexPath, movedToPath, resolveStore, unitDir, withLock, UNIT_PATTERN } from "./store.ts";
 
 /** Directory where the handoff lives for a given project cwd. */
 export function handoffDir(cwd: string): string {
@@ -247,13 +248,30 @@ function mdEscapeInline(s: string): string {
 export function toMarkdown(h: Handoff): string {
 	const lines: string[] = [];
 	const v = validateHandoff(h);
-	lines.push(`# Context handoff (${h.driver})${v.ok ? "" : " — DRAFT (spine not yet filled)"}`);
+	if (h.schema === "session-link/handoff/v2") {
+		const v2 = h as HandoffV2;
+		const draft = v.ok ? "" : " — DRAFT (spine not yet filled)";
+		const prov = v2.unitProvisional
+			? " — ⚠️ ПРОВИЗОРНОЕ ИМЯ, переименуйте командой /session-link-name"
+			: "";
+		lines.push(`# Handoff — линия ${v2.unit} · звено ${v2.seq}${draft}${prov}`);
+	} else {
+		lines.push(`# Context handoff (${h.driver})${v.ok ? "" : " — DRAFT (spine not yet filled)"}`);
+	}
 	lines.push("");
 	lines.push(`- Created: ${h.createdAt}`);
 	if (h.sessionName) lines.push(`- Previous session: ${h.sessionName}`);
 	if (h.sessionId) lines.push(`- Session id: \`${h.sessionId}\``);
 	if (h.model) lines.push(`- Model: ${h.model}`);
 	lines.push(`- Working directory: \`${h.cwd}\``);
+	if (h.schema === "session-link/handoff/v2") {
+		const v2 = h as HandoffV2;
+		lines.push(`- Line: \`${v2.unit}\``);
+		lines.push(`- Sequence: ${v2.seq}`);
+		if (v2.lineState && v2.lineState !== "active") lines.push(`- Line state: ${v2.lineState}`);
+		if (v2.parent) lines.push(`- Parent link: \`${v2.parent.id}\`${v2.parent.store ? " (cross-store)" : ""}`);
+		if (v2.unitProvisional) lines.push(`- ⚠️ Имя техническое — назовите линию: \\/session-link-name <unit\``);
+	}
 	lines.push("");
 
 	lines.push("## How to query this previous session headlessly");
@@ -262,6 +280,27 @@ export function toMarkdown(h: Handoff): string {
 	lines.push(h.howToAsk);
 	lines.push("```");
 	lines.push("");
+	if (h.schema === "session-link/handoff/v2") {
+		const d = (h as HandoffV2).derived;
+		if (d && (d.branch || d.baseRef || d.commits || d.filesChanged || d.startedAt || d.endedAt)) {
+			lines.push("## Facts (derived — collected, not authored)");
+			lines.push("");
+			if (d.branch) lines.push(`- Branch: \`${d.branch}\``);
+			if (d.baseRef) lines.push(`- Base ref: \`${d.baseRef}\``);
+			if (d.commits) lines.push(`- Commits since base: ${d.commits.length}`);
+			if (d.startedAt || d.endedAt) {
+				const span = [d.startedAt, d.endedAt].filter(Boolean).join(" → ");
+				lines.push(`- Time: ${span}`);
+			}
+			if (d.filesChanged && d.filesChanged.length) {
+				lines.push("");
+				lines.push("Changed files (git):");
+				lines.push("");
+				for (const f of d.filesChanged) lines.push(`- \`${f}\``);
+			}
+			lines.push("");
+		}
+	}
 
 	if (h.goal) {
 		lines.push("## Goal");
@@ -485,4 +524,192 @@ export function migrateLegacyHead(cwd: string, opts: MigrationOptions = {}): Mig
 	fs.writeFileSync(movedToPath(legacyDir), newDir + "\n", "utf-8");
 
 	return { unit, id, provisional, newPath: headPath(store, unit), link: v2 };
+}
+
+// ── writeLink: v2 запись, три случая (§5.1) ───────────────────────────────
+
+/** Input for a v2 write: a full envelope+body minus the code-owned identity
+ *  fields (schema/id/parent/seq/derived/unit) which `writeLink` assigns, plus
+ *  the derived inputs `baseRef`/`startedAt`. */
+export type WriteLinkInput = Omit<HandoffV2, "schema" | "id" | "parent" | "seq" | "derived" | "unit"> & {
+	unit?: string;
+	baseRef?: string;
+	startedAt?: string;
+};
+
+export type WriteCase = "redo-in-place" | "new-link" | "first-link";
+
+export interface WriteResult {
+	unit: string;
+	id: string;
+	seq: number;
+	path: string;
+	caseName: WriteCase;
+	link: HandoffV2;
+}
+
+export interface WriteLinkOptions {
+	now?: Date;
+	hex?: () => string;
+	lock?: WithLockOptions;
+}
+
+/**
+ * Write a v2 link under the store lock (§5 + §5.1). Three cases, decided by the
+ * line's head and the writer's `sessionId`: redo-in-place (rewrite, no archive,
+ * seq unchanged, agent body carried forward), new link (archive head, advance
+ * seq, parent = old head), first link (seq=1, no parent). A legacy v1 head of
+ * THIS cwd is migrated first (§2.4, per-cwd under the lock). `derived` is
+ * collected before the lock and ALWAYS rebuilt, even on redo. Loser of the
+ * lock race gets a LockBusyError (§9). index.json is updated in Э7.
+ */
+export async function writeLink(
+	cwd: string,
+	input: WriteLinkInput,
+	opts: WriteLinkOptions = {},
+): Promise<WriteResult> {
+	const store = resolveStore(cwd).root;
+	// Collect git facts BEFORE the lock — git reads must not hold the store lock.
+	const derived = collectDerived(cwd, input.baseRef, input.startedAt);
+
+	return withLock(
+		store,
+		() => {
+			// §2.4: migrate THIS cwd's legacy v1 head first (per-cwd, under the lock).
+			try {
+				migrateLegacyHead(cwd, { unit: input.unit, now: opts.now, hex: opts.hex });
+			} catch {
+				// migration is best-effort; the write must still proceed
+			}
+
+			const head = locateHead(store, input.unit);
+			const result = buildLink(store, input, head, derived, opts);
+			persistLink(store, result);
+			return result;
+		},
+		opts.lock ?? {},
+	);
+}
+
+/** Find the line's current v2 head (by unit, or the single default active line).
+ *  Ambiguous (N>1 active, no unit) ⇒ throw — §4.3 forbids picking for the operator. */
+function locateHead(store: string, unit: string | undefined): { path: string; link: HandoffV2 } | undefined {
+	let p: string | undefined;
+	if (unit) {
+		const candidate = headPath(store, unit);
+		if (fs.existsSync(candidate)) p = candidate;
+	} else {
+		const def = resolveDefaultUnit(store);
+		if (def.kind === "single") {
+			p = headPath(store, def.unit);
+		} else if (def.kind === "ambiguous") {
+			throw new Error(
+				`несколько активных линий в store; укажите unit=. Линии: ` + def.lines.map((l) => l.unit).join(", "),
+			);
+		}
+	}
+	if (!p) return undefined;
+	const link = readHandoff(p);
+	if (!link || link.schema !== "session-link/handoff/v2") return undefined;
+	return { path: p, link };
+}
+
+/** Decide the case (§5.1) and assemble the v2 link object. */
+function buildLink(
+	store: string,
+	input: WriteLinkInput,
+	head: { path: string; link: HandoffV2 } | undefined,
+	derived: DerivedFacts,
+	opts: WriteLinkOptions,
+): WriteResult {
+	const sameSession = !!head && !!input.sessionId && head.link.sessionId === input.sessionId;
+	let unit: string;
+	let id: string;
+	let seq: number;
+	let parent: ParentRef | undefined;
+	let parentHandoffPath: string | undefined;
+	let unitProvisional: boolean | undefined;
+	let caseName: WriteCase;
+
+	if (head && sameSession) {
+		// REDO in place — rewrite; id/seq/parent unchanged, body carried forward.
+		unit = head.link.unit;
+		id = head.link.id;
+		seq = head.link.seq;
+		parent = head.link.parent;
+		parentHandoffPath = head.link.parentHandoffPath;
+		unitProvisional = head.link.unitProvisional;
+		caseName = "redo-in-place";
+	} else if (head) {
+		// NEW link — different session advances the line; archive the old head.
+		unit = head.link.unit; // inherit the line name (rename is Э8)
+		unitProvisional = head.link.unitProvisional;
+		id = generateId(store, { now: opts.now, hex: opts.hex });
+		seq = head.link.seq + 1;
+		parent = { id: head.link.id, unit: head.link.unit, seq: head.link.seq };
+		const archive = archivePath(store, head.link.unit, head.link.id);
+		try {
+			fs.copyFileSync(head.path, archive);
+			parentHandoffPath = archive;
+		} catch {
+			// archive is best-effort; chain link only set if the copy succeeded
+		}
+		caseName = "new-link";
+	} else {
+		// FIRST link of a line.
+		const assigned = assignUnit({ given: input.unit, now: opts.now, hex: opts.hex });
+		unit = assigned.unit;
+		unitProvisional = assigned.provisional ? true : undefined;
+		id = generateId(store, { now: opts.now, hex: opts.hex });
+		seq = 1;
+		parent = undefined;
+		parentHandoffPath = undefined;
+		caseName = "first-link";
+	}
+
+	// Strip the derived-input-only fields before materializing the link.
+	const rest = { ...input } as Partial<WriteLinkInput>;
+	delete rest.baseRef;
+	delete rest.startedAt;
+	delete (rest as { unit?: string }).unit;
+
+	const link = {
+		...rest,
+		schema: "session-link/handoff/v2",
+		id,
+		unit,
+		seq,
+		parent,
+		parentHandoffPath,
+		derived,
+	} as HandoffV2;
+	if (unitProvisional) link.unitProvisional = true;
+	else delete link.unitProvisional;
+
+	if (head && sameSession) mergeBodyForward(link, head.link);
+
+	return { unit, id, seq, path: headPath(store, unit), caseName, link };
+}
+
+/** Carry agent-authored body fields from `src` onto `dst` ONLY where dst is
+ *  empty — a failed authoring pass keeps the previous good value (§5.1).
+ *  `derived` is never carried (always rebuilt). */
+function mergeBodyForward(dst: HandoffV2, src: HandoffV2): void {
+	for (const k of AGENT_BODY_FIELDS) {
+		const sv = (src as unknown as Record<string, unknown>)[k];
+		const dv = (dst as unknown as Record<string, unknown>)[k];
+		if (sv !== undefined && dv === undefined) (dst as unknown as Record<string, unknown>)[k] = sv;
+	}
+}
+
+/** Persist the link: head.json via temp+rename, then the .md projection.
+ *  Data first; index.json is Э7. */
+function persistLink(store: string, result: WriteResult): void {
+	const dir = unitDir(store, result.unit);
+	fs.mkdirSync(dir, { recursive: true });
+	const finalPath = headPath(store, result.unit);
+	const tmp = finalPath + ".tmp";
+	fs.writeFileSync(tmp, JSON.stringify(result.link, null, 2) + "\n", "utf-8");
+	fs.renameSync(tmp, finalPath);
+	fs.writeFileSync(headMdPath(store, result.unit), toMarkdown(result.link) + "\n", "utf-8");
 }
