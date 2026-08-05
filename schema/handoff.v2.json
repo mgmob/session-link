@@ -4,10 +4,28 @@
   "title": "session-link handoff v2",
   "description": "Три зоны: конверт (владелец — код), derived (владелец — код, факты), авторская часть (владелец — агент). Факты собираются, смысл пишется. ВНИМАНИЕ: схема нормативна как описание формата и предназначена для диагностики (--validate). Путь чтения обязан быть снисходительным и СОХРАНЯТЬ незнакомые поля при перезаписи — иначе старая версия инструмента молча съест данные новой (см. §7.4 контракта).",
   "type": "object",
-  "required": ["schema", "createdAt", "driver", "sessionRef", "cwd", "howToAsk", "askCommand", "unit", "seq"],
+  "required": ["schema", "id", "createdAt", "driver", "sessionRef", "cwd", "howToAsk", "askCommand", "unit", "seq"],
   "additionalProperties": false,
   "properties": {
     "schema": { "const": "session-link/handoff/v2" },
+
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9]{8}T[0-9]{9}-[0-9a-f]{4}$",
+      "description": "Неизменный идентификатор звена: <YYYYMMDD>T<HHMMSSmmm>-<4hex>. Задаётся при первой записи и не меняется никогда — ни при redo-in-place, ни при архивации, ни при переносе. Имя файла архива: handoff-<id>.json."
+    },
+    "parent": {
+      "type": "object",
+      "description": "Структурная ссылка на предка (§2.5). Источник истины — id; путь parentHandoffPath лишь подсказка. Отсутствует у первого звена линии.",
+      "required": ["id"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "unit": { "type": "string", "description": "Подсказка, в каком каталоге искать — попадание за одно обращение к ФС." },
+        "seq": { "type": "integer", "minimum": 1 },
+        "store": { "type": "string", "description": "Абсолютный путь к ЧУЖОМУ store; задан только для межпапочных цепочек." }
+      }
+    },
 
     "createdAt": { "type": "string", "format": "date-time" },
     "driver": { "enum": ["pi", "claude-code", "qwen"] },
@@ -129,7 +147,7 @@
     "committedSessionFile": { "type": "string" },
     "parentHandoffPath": {
       "type": "string",
-      "description": "Абсолютный путь к неизменяемому архиву предка. Никогда не указывает на живой handoff.json."
+      "description": "Абсолютный путь к архиву предка НА МОМЕНТ ЗАПИСИ. Понижен до подсказки: источник истины — parent.id (§2.5), путь используется для v1-цепочек и как последний шанс. При расхождении верить идентификатору. Никогда не указывает на живой handoff.json."
     }
   }
 }
