@@ -1,0 +1,36 @@
+{
+  "schema": "session-link/handoff/v1",
+  "createdAt": "2026-07-01T10:00:00.000Z",
+  "driver": "pi",
+  "sessionRef": "/home/omr/.pi/agent/sessions/22222222-2222-4222-8222-222222222222.jsonl",
+  "sessionId": "22222222-2222-4222-8222-222222222222",
+  "sessionName": "omr-foundation-2",
+  "cwd": "/home/omr/projects/omr",
+  "model": "zai-coding-cn/glm-5.2",
+  "howToAsk": "printf '%s' \"<your question>\" | pi --mode json --session /home/omr/.pi/agent/sessions/22222222-2222-4222-8222-222222222222.jsonl --tools read,grep,find,ls --model zai-coding-cn/glm-5.2",
+  "askCommand": [
+    "pi",
+    "--mode",
+    "json",
+    "--session",
+    "/home/omr/.pi/agent/sessions/22222222-2222-4222-8222-222222222222.jsonl",
+    "--tools",
+    "read,grep,find,ls",
+    "--model",
+    "zai-coding-cn/glm-5.2"
+  ],
+  "language": "Russian",
+  "goal": "Подвести фундамент проекта OMR: репозиторий, схема данных, конфигурация.",
+  "summary": "Схема данных описана, добавлены миграции, indexer читает конфиг.",
+  "nextStep": "Реализовать чтение конфигурации (YAML + ENV).",
+  "sessionTitle": "OMR: фундамент #2",
+  "filesToRead": [
+    "src/config.ts",
+    "README.md"
+  ],
+  "environment": [
+    "Node v22.23.2",
+    "OS: Linux x86_64"
+  ],
+  "parentHandoffPath": "handoff-2026-07-01T10-00-00-000Z.json"
+}

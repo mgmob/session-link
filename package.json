@@ -15,7 +15,8 @@
   "scripts": {
     "clean": "echo 'nothing to clean'",
     "build": "echo 'pi loads .ts directly — nothing to build'",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types \"tests/**/*.test.ts\""
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
