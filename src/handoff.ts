@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Handoff, HandoffV2, LineState } from "./types.ts";
-import { headPath, indexPath, movedToPath, resolveStore, UNIT_PATTERN } from "./store.ts";
+import type { Handoff, HandoffV1, HandoffV2, LineState } from "./types.ts";
+import { assignUnit, generateId, headMdPath, headPath, indexPath, movedToPath, resolveStore, unitDir, UNIT_PATTERN } from "./store.ts";
 
 /** Directory where the handoff lives for a given project cwd. */
 export function handoffDir(cwd: string): string {
@@ -410,4 +410,79 @@ export function markCommitted(cwd: string, committedAt: string, committedSession
 	} catch {
 		// commit marker is best-effort
 	}
+}
+/**
+ * Convert a v1 head into a v2 link (§2.4 step 1-2): schema bumped, immutable
+ * `id` + line `unit` assigned, `seq` starts at 1 (first v2 link of the line).
+ * Every v1 field — including the v1 ancestor `parentHandoffPath` — is preserved
+ * whole, so unknown fields survive and the v1 chain stays reachable.
+ */
+export function convertV1ToV2Link(v1: HandoffV1, id: string, unit: string, provisional: boolean): HandoffV2 {
+	const v2: HandoffV2 = { ...v1, schema: "session-link/handoff/v2", id, unit, seq: 1 };
+	if (provisional) v2.unitProvisional = true;
+	return v2;
+}
+
+export interface MigrationOptions {
+	/** Operator-given unit (otherwise a technical name is minted). */
+	unit?: string;
+	now?: Date;
+	hex?: () => string;
+}
+
+export interface MigrationResult {
+	unit: string;
+	id: string;
+	provisional: boolean;
+	/** Path to the migrated head: `<store>/<unit>/handoff.json`. */
+	newPath: string;
+	link: HandoffV2;
+}
+
+/**
+ * Migrate a legacy v1 head into the v2 store (§2.4), invoked at first write.
+ *
+ * Detects THIS cwd's own legacy head directly (its <cwd>/.pi/session_link/
+ * handoff.json, unless a MOVED-TO marker says it migrated) — NOT via findHandoff,
+ * whose step 2 (§4.3) would return the store default once a line exists and hide
+ * a sibling worktree's legacy (breaking invariant 19). Assigns a `unit` (§3.2) and
+ * `id` (§2.5), converts it to a v2 link, and MOVES (not copies) only the head
+ * (`handoff.json` + `handoff.md`) into `<store>/<unit>/`. v1 archives stay where
+ * they are — they have no id and moving them would sever the chain at the
+ * migration point; they remain reachable via `parentHandoffPath` (§2.5 step 4).
+ * A one-line `MOVED-TO.txt` is left in the old dir so a human sees a pointer
+ * and findHandoff step 3 no longer returns the stale head.
+ *
+ * Returns undefined when there is no legacy head to migrate.
+ */
+export function migrateLegacyHead(cwd: string, opts: MigrationOptions = {}): MigrationResult | undefined {
+	// Per-cwd detection of THIS folder's own legacy head — not via findHandoff
+	// (its §4.3 default-line step would hide a sibling worktree's legacy once the
+	// shared store has a line; migration must be per-cwd to satisfy invariant 19).
+	const legacyDir = handoffDir(cwd);
+	const legacyPath = handoffPath(cwd);
+	if (!fs.existsSync(legacyPath)) return undefined;
+	if (fs.existsSync(movedToPath(legacyDir))) return undefined; // already migrated
+
+	const v1 = readHandoff(legacyPath);
+	if (!v1 || v1.schema !== "session-link/handoff/v1") return undefined;
+
+	const store = resolveStore(cwd).root;
+	const { unit, provisional } = assignUnit({ given: opts.unit, now: opts.now, hex: opts.hex });
+	const id = generateId(store, { now: opts.now, hex: opts.hex });
+	const v2 = convertV1ToV2Link(v1 as HandoffV1, id, unit, provisional);
+
+	const newDir = unitDir(store, unit);
+	fs.mkdirSync(newDir, { recursive: true });
+	fs.writeFileSync(headPath(store, unit), JSON.stringify(v2, null, 2) + "\n", "utf-8");
+	fs.writeFileSync(headMdPath(store, unit), toMarkdown(v2) + "\n", "utf-8");
+
+	// Move (not copy): remove the legacy head + its projection. v1 archives stay.
+	fs.rmSync(legacyPath, { force: true });
+	fs.rmSync(path.join(legacyDir, "handoff.md"), { force: true });
+
+	// Relocation marker — for humans and to block findHandoff step 3.
+	fs.writeFileSync(movedToPath(legacyDir), newDir + "\n", "utf-8");
+
+	return { unit, id, provisional, newPath: headPath(store, unit), link: v2 };
 }

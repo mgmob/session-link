@@ -152,6 +152,64 @@ export function idExists(storeRoot: string, id: string): boolean {
 	return false;
 }
 
+/** Options for `assignUnit` (test seams mirror `generateId`). */
+export interface AssignUnitOptions {
+	/** Operator-given name — strict-checked, used as-is. */
+	given?: string;
+	/** Inherit from the parent line's unit (§3.2 step 2), when there is one. */
+	parentUnit?: string;
+	now?: Date;
+	hex?: () => string;
+}
+
+export interface AssignedUnit {
+	unit: string;
+	/** True when the name is technical (u-…) and unconfirmed by the operator. */
+	provisional: boolean;
+}
+
+/**
+ * Decide a line's `unit` (§3.2): operator-given → inherited from parent →
+ * technical `u-<YYYYMMDD>-<HHMMSS>-<4hex>` (marked provisional). A given name is
+ * validated STRICTLY against UNIT_PATTERN and rejected with a sluggify hint —
+ * never silently normalized (§3.1). The unit is never derived from the folder
+ * name: lines move between folders and the folder would lie exactly there.
+ */
+export function assignUnit(opts: AssignUnitOptions): AssignedUnit {
+	if (opts.given !== undefined && opts.given !== "") {
+		if (!UNIT_PATTERN.test(opts.given)) {
+			throw new Error(
+				`unit "${opts.given}" недопустим: разрешено [a-z0-9][a-z0-9-]{0,63}. ` +
+					`Возможно, имелось в виду "${sluggifyHint(opts.given)}».`,
+			);
+		}
+		return { unit: opts.given, provisional: false };
+	}
+	if (opts.parentUnit && UNIT_PATTERN.test(opts.parentUnit)) {
+		return { unit: opts.parentUnit, provisional: false };
+	}
+	return { unit: technicalUnit(opts.now ?? new Date(), opts.hex), provisional: true };
+}
+
+/** Technical line name `u-<YYYYMMDD>-<HHMMSS>-<4hex>` (§3.2 step 3) — unique by construction. */
+export function technicalUnit(now: Date, hex?: () => string): string {
+	const h = hex ?? (() => crypto.randomBytes(2).toString("hex"));
+	const pad = (n: number, w: number) => String(n).padStart(w, "0");
+	const d = now;
+	return `u-${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1, 2)}${pad(d.getUTCDate(), 2)}-` +
+		`${pad(d.getUTCHours(), 2)}${pad(d.getUTCMinutes(), 2)}${pad(d.getUTCSeconds(), 2)}-${h()}`;
+}
+
+/** Sluggify a name into a UNIT_PATTERN-shaped suggestion (§3.1 — hint only, never a source of truth). */
+export function sluggifyHint(name: string): string {
+	const s = name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+	if (!s) return "line";
+	// ensure a leading alnum (UNIT_PATTERN requires it)
+	const fixed = /^[a-z0-9]/.test(s) ? s : `n-${s}`;
+	return fixed.slice(0, 64);
+}
+
+
 // ── Layout helpers (paths only — no FS writes) ────────────────────────────────
 // Every path is absolute given absolute inputs; the store root is the pivot.
 
