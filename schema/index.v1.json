@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mgmob/session-link/schema/index.v1.json",
   "title": "session-link index v1",
-  "description": "Оглавление линий store. Производный кэш, не источник истины: восстановим обходом <store>/*/handoff.json командой --rebuild-index. Безымянная линия сюда не попадает.",
+  "description": "Оглавление линий store. Производный кэш, не источник истины: восстановим обходом <store>/*/handoff.json командой --rebuild-index, включая state (он зеркалит lineState головы). Унаследованная безымянная линия v1 сюда не попадает — у неё нет ключа.",
   "type": "object",
   "required": ["schema", "units"],
   "additionalProperties": false,
@@ -24,7 +24,11 @@
           "sessions": { "type": "integer", "minimum": 1 },
           "state": {
             "enum": ["active", "done", "abandoned"],
-            "description": "Линия — цель, сессия — попытка. Провал сессии не проваливает линию: state остаётся active. done/abandoned выставляются только явным действием."
+            "description": "Зеркало lineState головы линии — источник истины там, иначе пересборка индекса воскрешала бы закрытые линии. Провал сессии линию не закрывает."
+          },
+          "unitProvisional": {
+            "type": "boolean",
+            "description": "Имя линии техническое, оператор его не подтверждал — показывать с подсказкой переименовать."
           },
           "cwd": {
             "type": "string",

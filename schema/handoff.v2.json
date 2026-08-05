@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/mgmob/session-link/schema/handoff.v2.json",
   "title": "session-link handoff v2",
-  "description": "Три зоны: конверт (владелец — код), derived (владелец — код, факты), авторская часть (владелец — агент). Факты собираются, смысл пишется.",
+  "description": "Три зоны: конверт (владелец — код), derived (владелец — код, факты), авторская часть (владелец — агент). Факты собираются, смысл пишется. ВНИМАНИЕ: схема нормативна как описание формата и предназначена для диагностики (--validate). Путь чтения обязан быть снисходительным и СОХРАНЯТЬ незнакомые поля при перезаписи — иначе старая версия инструмента молча съест данные новой (см. §7.4 контракта).",
   "type": "object",
-  "required": ["schema", "createdAt", "driver", "sessionRef", "cwd", "howToAsk", "askCommand", "seq"],
+  "required": ["schema", "createdAt", "driver", "sessionRef", "cwd", "howToAsk", "askCommand", "unit", "seq"],
   "additionalProperties": false,
   "properties": {
     "schema": { "const": "session-link/handoff/v2" },
@@ -27,12 +27,20 @@
     "unit": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
-      "description": "Имя линии. Отсутствует у безымянной линии — это легальное состояние. Из имени папки НЕ выводится."
+      "description": "Имя линии, обязательно для v2. Задано оператором, унаследовано от родителя либо техническое (u-<YYYYMMDD>-<HHMMSS>-<4hex>). Из имени папки НЕ выводится."
+    },
+    "unitProvisional": {
+      "type": "boolean",
+      "description": "Имя техническое, оператор его не подтверждал. Снимается командой /session-link-name."
     },
     "seq": {
       "type": "integer",
       "minimum": 1,
-      "description": "Номер звена в линии, монотонно растёт. Ведётся инструментом, сравнивается потребителем."
+      "description": "Номер звена в линии. Новое звено = seq(головы)+1; redo-in-place не меняет; производная линия при ветвлении от N начинает с N+1."
+    },
+    "lineState": {
+      "enum": ["active", "done", "abandoned"],
+      "description": "Состояние ЛИНИИ (не сессии), источник истины для index.json. Отсутствует ⇒ active. Провал сессии линию не закрывает."
     },
 
     "derived": {
