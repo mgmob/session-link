@@ -245,3 +245,155 @@ export function movedToPath(oldDir: string): string {
 export function incomingPath(targetStoreRoot: string, unit: string): string {
 	return path.join(targetStoreRoot, "incoming", `${unit}.json`);
 }
+
+// ── Lock (§5) ──────────────────────────────────────────────────────────────
+// Store-wide: index.json is the single contention point, so per-unit granularity
+// wouldn't help. A live owner is identified by pid + process start time; a stale
+// lock left by a killed owner MUST be reclaimed, or the first crash makes writing
+// a handoff in the project impossible forever.
+
+/** Process start time (epoch ms), fixed at module load. Two attempts in the same
+ *  process share it; a reused pid (a new process) gets a different one. */
+const PROCESS_START_EPOCH_MS = Date.now() - Math.floor(process.uptime() * 1000);
+
+export interface LockContent {
+	/** Owner pid. */
+	pid: number;
+	/** Owner process start time (epoch ms) — distinguishes pid reuse. */
+	startedAt: number;
+	/** When the lock was acquired (epoch ms) — diagnostics only. */
+	acquiredAt: number;
+}
+
+/** Honest refusal for the loser of the lock race (§9). Never a silent overwrite. */
+export class LockBusyError extends Error {
+	readonly lockPath: string;
+	readonly owner: LockContent | undefined;
+	constructor(lockPath: string, owner: LockContent | undefined, timeoutMs: number) {
+		const pid = owner ? ` (pid ${owner.pid})` : "";
+		super(
+			`store занят другим процессом${pid}; ожидание ${timeoutMs}мс истекло по пути ${lockPath}. ` +
+				`Повторите позже или снимите протухший лок вручную.`,
+		);
+		this.name = "LockBusyError";
+		this.lockPath = lockPath;
+		this.owner = owner;
+	}
+}
+
+export interface WithLockOptions {
+	/** How long to wait for a live owner before refusing (default 10s). */
+	timeoutMs?: number;
+	/** Polling interval while waiting (default 50ms). */
+	pollMs?: number;
+	/** Sink for stale-lock reclamation notices. */
+	log?: (msg: string) => void;
+}
+
+const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
+const DEFAULT_LOCK_POLL_MS = 50;
+
+/**
+ * Run `fn` under the store-wide lock (§5). The lock file holds {pid, startedAt,
+ * acquiredAt}; a dead/stale owner is reclaimed. On timeout the loser gets a
+ * `LockBusyError` (an honest refusal, not a silent overwrite). The lock is always
+ * released in `finally`, even if `fn` throws.
+ */
+export async function withLock<T>(
+	store: string,
+	fn: () => T | Promise<T>,
+	opts: WithLockOptions = {},
+): Promise<T> {
+	fs.mkdirSync(store, { recursive: true });
+	const lockP = lockPath(store);
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_LOCK_POLL_MS;
+	const log = opts.log ?? (() => {});
+	const deadline = Date.now() + timeoutMs;
+
+	let acquired = false;
+	try {
+		while (Date.now() < deadline) {
+			if (tryAcquire(lockP)) {
+				acquired = true;
+				break;
+			}
+			const owner = readStaleOwner(lockP);
+			if (owner) {
+				log(
+					`session-link: reclaiming stale store lock at ${lockP} ` +
+						`(pid ${owner.pid}, started ${new Date(owner.startedAt).toISOString()}).`,
+				);
+				fs.rmSync(lockP, { force: true });
+				continue; // retry acquire immediately
+			}
+			await sleep(pollMs);
+		}
+		if (!acquired) {
+			let owner: LockContent | undefined;
+			try {
+				owner = JSON.parse(fs.readFileSync(lockP, "utf-8"));
+			} catch {
+				// unreadable / gone — no owner to report
+			}
+			throw new LockBusyError(lockP, owner, timeoutMs);
+		}
+		return await fn();
+	} finally {
+		if (acquired) fs.rmSync(lockP, { force: true });
+	}
+}
+
+/** Attempt an exclusive (O_EXCL) create of the lock file. True on success, false if held. */
+function tryAcquire(lockP: string): boolean {
+	const content: LockContent = { pid: process.pid, startedAt: PROCESS_START_EPOCH_MS, acquiredAt: Date.now() };
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(lockP, "wx");
+		fs.writeFileSync(fd, JSON.stringify(content));
+		return true;
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
+		throw e;
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// best-effort
+			}
+		}
+	}
+}
+
+/** Read the lock; return the owner ONLY if stale (dead pid, or our pid with a
+ *  different start time = pid reuse). A live owner or an unreadable lock → null. */
+function readStaleOwner(lockP: string): LockContent | null {
+	let c: LockContent;
+	try {
+		c = JSON.parse(fs.readFileSync(lockP, "utf-8"));
+	} catch {
+		return null; // unreadable: don't touch someone else's lock
+	}
+	if (typeof c.pid !== "number" || typeof c.startedAt !== "number") return null;
+	if (!isPidAlive(c.pid)) return c; // dead owner → stale
+	if (c.pid === process.pid && c.startedAt !== PROCESS_START_EPOCH_MS) return c; // reused pid
+	return null; // live owner
+}
+
+/** Is `pid` an existing process? signal 0 probes without delivering a signal. */
+function isPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (e) {
+		const code = (e as NodeJS.ErrnoException).code;
+		if (code === "ESRCH") return false; // no such process
+		if (code === "EPERM") return true; // exists, just not ours to signal
+		return true; // unknown — assume alive (safer than deleting someone's lock)
+	}
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((r) => setTimeout(r, ms));
+}
