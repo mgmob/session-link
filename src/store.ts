@@ -25,6 +25,10 @@ export const STORE_SUBDIR = path.join(".pi", "session_link");
 /** Regex a link id matches (contract §2.5 / schema pattern). */
 export const ID_PATTERN = /^[0-9]{8}T[0-9]{9}-[0-9a-f]{4}$/;
 
+/** Line-name regex (§3.1): lowercase alnum + hyphens, 1–64 chars, leading alnum.
+ *  Strict — no silent normalization; a violation is rejected with a sluggify hint. */
+export const UNIT_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
 export interface ResolvedStore {
 	/** Absolute path to the store root (`<root>/.pi/session_link`). */
 	root: string;

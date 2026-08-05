@@ -47,7 +47,7 @@ import * as path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Handoff, StartMode } from "./types.ts";
-import { findHandoff, handoffPath, markCommitted, readHandoff, validateHandoff, writeHandoff } from "./handoff.ts";
+import { findHandoff, findHeadPath, handoffPath, markCommitted, readHandoff, validateHandoff, writeHandoff } from "./handoff.ts";
 import { querySession } from "./drivers/index.ts";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.SESSION_LINK_TIMEOUT_MS || 5 * 60 * 1000);
@@ -583,7 +583,7 @@ export default function (pi: ExtensionAPI): void {
 				notify(ctx, "session-link-go requires interactive (TUI) mode", "error");
 				return;
 			}
-			const hp = findHandoff(ctx.cwd);
+			const hp = findHeadPath(findHandoff(ctx.cwd));
 			if (!hp) {
 				notify(ctx, `No handoff found at ${path.join(ctx.cwd, HANDOFF_DIR, "handoff.json")}. Run /session-link first.`, "warning");
 				return;
@@ -645,7 +645,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("session-link-show", {
 		description: "Show the current handoff for this project (path + spine status), if any.",
 		handler: async (_args, ctx) => {
-			const hp = findHandoff(ctx.cwd);
+			const hp = findHeadPath(findHandoff(ctx.cwd));
 			if (!hp) {
 				notify(ctx, `No handoff found at ${path.join(ctx.cwd, HANDOFF_DIR, "handoff.json")}`, "info");
 				return;
@@ -688,7 +688,7 @@ export default function (pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const handoffPathArg = (params as { handoffPath?: string }).handoffPath;
-			const hp = handoffPathArg || findHandoff(ctx.cwd);
+			const hp = handoffPathArg || findHeadPath(findHandoff(ctx.cwd));
 			if (!hp) {
 				return {
 					content: [
@@ -762,7 +762,7 @@ export default function (pi: ExtensionAPI): void {
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const file = ctx.sessionManager.getSessionFile();
 			const id = deriveSessionId(file);
-			const hp = findHandoff(ctx.cwd);
+			const hp = findHeadPath(findHandoff(ctx.cwd));
 			const obj = { sessionId: id, sessionFile: file ?? null, cwd: ctx.cwd, handoffPath: hp ?? null };
 			return {
 				content: [{ type: "text", text: JSON.stringify(obj, null, 2) }],
@@ -774,7 +774,7 @@ export default function (pi: ExtensionAPI): void {
 	// --- nudge: if a handoff is present when a fresh session starts ---------------
 	pi.on("session_start", async (event, ctx) => {
 		if (event.reason !== "new" && event.reason !== "startup") return;
-		const hp = findHandoff(ctx.cwd);
+		const hp = findHeadPath(findHandoff(ctx.cwd));
 		if (!hp) return;
 		const h = readHandoff(hp);
 		if (h) {

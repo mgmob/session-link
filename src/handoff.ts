@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Handoff } from "./types.ts";
+import type { Handoff, HandoffV2, LineState } from "./types.ts";
+import { headPath, indexPath, movedToPath, resolveStore, UNIT_PATTERN } from "./store.ts";
 
 /** Directory where the handoff lives for a given project cwd. */
 export function handoffDir(cwd: string): string {
@@ -12,24 +13,188 @@ export function handoffPath(cwd: string): string {
 	return path.join(handoffDir(cwd), "handoff.json");
 }
 
-/** Find the current handoff for a cwd, if any. */
-export function findHandoff(cwd: string): string | undefined {
-	const p = handoffPath(cwd);
-	return fs.existsSync(p) ? p : undefined;
+/** Сводка линии для перечня (§4.3). Строится из головы — источник истины, не из index. */
+export interface UnitSummary {
+	unit: string;
+	unitProvisional?: boolean;
+	state: LineState;
+	seq: number;
+	updatedAt: string;
+	cwd: string;
+	/** Первая непустая строка nextStep головы — ориентир, о какой это линии. */
+	nextStepFirstLine?: string;
 }
 
-/** Read + validate a handoff. Returns undefined if missing/corrupt/wrong schema. */
-export function readHandoff(p: string): Handoff | undefined {
+/** Результат поиска головы линии (§2.3). */
+export type FindResult =
+	| { kind: "head"; path: string; unit: string }
+	| { kind: "legacy"; path: string }
+	| { kind: "ambiguous"; lines: UnitSummary[] }
+	| { kind: "none" };
+
+/** Линия по умолчанию, когда `unit` не задан (§4.3). */
+export type DefaultUnit =
+	| { kind: "single"; unit: string }
+	| { kind: "ambiguous"; lines: UnitSummary[] }
+	| { kind: "none" };
+
+/** Запись оглавления (§4). index.json — производный кэш, истина в головах. */
+export interface IndexEntry {
+	head: string;
+	updatedAt: string;
+	sessions: number;
+	state: LineState;
+	cwd: string;
+	unitProvisional?: boolean;
+}
+
+export interface HandoffIndex {
+	schema: "session-link/index/v1";
+	units: Record<string, IndexEntry>;
+}
+
+/**
+ * Линия по умолчанию, когда `unit` не задан (§4.3).
+ *
+ * Обходит каталоги линий store и читает каждую голову напрямую — НЕ доверяет
+ * index.json (производный кэш, может рассинхронизироваться): активное
+ * множество и его факты берутся из живых голов. Одна active → она; несколько →
+ * ambiguous; ни одной → none, и вызывающий идёт к шагу legacy.
+ */
+export function resolveDefaultUnit(store: string): DefaultUnit {
+	const actives: UnitSummary[] = [];
+	let unitDirs: fs.Dirent[];
 	try {
-		const raw = fs.readFileSync(p, "utf-8");
-		const obj = JSON.parse(raw);
-		if (obj && obj.schema === "session-link/handoff/v1") {
-			return obj as Handoff;
-		}
-		return undefined;
+		unitDirs = fs.readdirSync(store, { withFileTypes: true });
+	} catch {
+		return { kind: "none" };
+	}
+	for (const e of unitDirs) {
+		if (!e.isDirectory()) continue;
+		const unit = e.name;
+		if (unit === "incoming") continue; // incoming/ — указатели переезда (§2.6), не линии
+		const s = readUnitSummary(store, unit);
+		if (s && s.state === "active") actives.push(s);
+	}
+	if (actives.length === 0) return { kind: "none" };
+	if (actives.length === 1) return { kind: "single", unit: actives[0].unit };
+	actives.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
+	return { kind: "ambiguous", lines: actives };
+}
+
+/** Сводка линии из её головы; undefined, если головы нет или она не v2 (безымянная v1 в перечень не попадает, §4). */
+function readUnitSummary(store: string, unit: string): UnitSummary | undefined {
+	const h = readHandoff(headPath(store, unit));
+	if (!h) return undefined;
+	if (h.schema !== "session-link/handoff/v2") return undefined;
+	const v2 = h as HandoffV2;
+	return {
+		unit: v2.unit,
+		unitProvisional: v2.unitProvisional,
+		state: v2.lineState ?? "active",
+		seq: v2.seq,
+		updatedAt: v2.committedAt ?? v2.createdAt,
+		cwd: v2.cwd,
+		nextStepFirstLine: firstLine(v2.nextStep),
+	};
+}
+
+function firstLine(s: string | undefined): string | undefined {
+	if (!s) return undefined;
+	const t = s.trim();
+	if (!t) return undefined;
+	const i = t.indexOf("\n");
+	return (i === -1 ? t : t.slice(0, i)).trim() || undefined;
+}
+
+/**
+ * Найти текущий handoff для cwd (§2.3).
+ *
+ * Порядок: (1) `unit` задан → голова этой линии; (2) без `unit` → правило линии
+ * по умолчанию (§4.3); (3) legacy `<cwd>/.pi/session_link/handoff.json`, если
+ * рядом нет маркера `MOVED-TO.txt`; (4) ничего.
+ */
+export function findHandoff(cwd: string, unit?: string): FindResult {
+	const store = resolveStore(cwd).root;
+
+	if (unit) {
+		const p = headPath(store, unit);
+		if (fs.existsSync(p)) return { kind: "head", path: p, unit };
+		// Явный unit + промах → none: не проваливаемся в legacy/чужую линию.
+		return { kind: "none" };
+	}
+
+	const def = resolveDefaultUnit(store);
+	if (def.kind === "single") {
+		return { kind: "head", path: headPath(store, def.unit), unit: def.unit };
+	}
+	if (def.kind === "ambiguous") {
+		return { kind: "ambiguous", lines: def.lines };
+	}
+
+	// def.kind === "none" → пробуем legacy-расположение v1.
+	const legacyDir = handoffDir(cwd);
+	const legacy = handoffPath(cwd);
+	if (fs.existsSync(legacy) && !fs.existsSync(movedToPath(legacyDir))) {
+		return { kind: "legacy", path: legacy };
+	}
+	return { kind: "none" };
+}
+
+/** Свернуть FindResult в путь, если он однозначен; иначе undefined.
+ *  Переходный хелпер для вызывающих, ещё не v2-aware (index.ts до Э9). */
+export function findHeadPath(r: FindResult): string | undefined {
+	return r.kind === "head" || r.kind === "legacy" ? r.path : undefined;
+}
+
+/** Прочитать оглавление store (§4). Только чтение — запись в Э7. Отсутствует/повреждён → undefined.
+ *  Истина — в головах; index производный, не полагаться как на источник. */
+export function readIndex(store: string): HandoffIndex | undefined {
+	let obj: Record<string, unknown>;
+	try {
+		obj = JSON.parse(fs.readFileSync(indexPath(store), "utf-8"));
 	} catch {
 		return undefined;
 	}
+	if (!obj || obj.schema !== "session-link/index/v1") return undefined;
+	if (!obj.units || typeof obj.units !== "object") return undefined;
+	return obj as unknown as HandoffIndex;
+}
+
+const HANDOFF_SCHEMAS = new Set(["session-link/handoff/v1", "session-link/handoff/v2"]);
+
+/**
+ * Прочитать handoff снисходительно (§7.4). Принимает всё семейство {v1, v2} по
+ * `schema`; проверяет МИНИМУМ (семейство schema, обязательные поля конверта, а
+ * для v2 — наличие id/unit/seq и regex unit). НЕзнакомые поля СОХРАНЯЮТСЯ:
+ * распарсенный объект возвращается целиком, без проекции в строгий тип, — так
+ * документ более новой формы переживает round-trip через старый инструмент.
+ * Полная проверка по схеме — отдельный диагностический режим `--validate`, не здесь.
+ */
+export function readHandoff(p: string): Handoff | undefined {
+	let obj: Record<string, unknown>;
+	try {
+		obj = JSON.parse(fs.readFileSync(p, "utf-8"));
+	} catch {
+		return undefined;
+	}
+	if (!obj || typeof obj !== "object") return undefined;
+	if (!HANDOFF_SCHEMAS.has(obj.schema as string)) return undefined;
+	// Обязательные поля конверта (общие для v1 и v2).
+	if (typeof obj.createdAt !== "string") return undefined;
+	if (typeof obj.driver !== "string") return undefined;
+	if (typeof obj.sessionRef !== "string") return undefined;
+	if (typeof obj.cwd !== "string") return undefined;
+	if (typeof obj.howToAsk !== "string") return undefined;
+	if (!Array.isArray(obj.askCommand)) return undefined;
+	// Обязательное v2 + regex unit.
+	if (obj.schema === "session-link/handoff/v2") {
+		if (typeof obj.id !== "string") return undefined;
+		if (typeof obj.unit !== "string") return undefined;
+		if (!UNIT_PATTERN.test(obj.unit)) return undefined;
+		if (!Number.isInteger(obj.seq)) return undefined;
+	}
+	return obj as unknown as Handoff;
 }
 
 function stamp(iso: string): string {
