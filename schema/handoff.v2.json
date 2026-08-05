@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mgmob/session-link/schema/handoff.v2.json",
+  "title": "session-link handoff v2",
+  "description": "Три зоны: конверт (владелец — код), derived (владелец — код, факты), авторская часть (владелец — агент). Факты собираются, смысл пишется.",
+  "type": "object",
+  "required": ["schema", "createdAt", "driver", "sessionRef", "cwd", "howToAsk", "askCommand", "seq"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "session-link/handoff/v2" },
+
+    "createdAt": { "type": "string", "format": "date-time" },
+    "driver": { "enum": ["pi", "claude-code", "qwen"] },
+    "sessionRef": { "type": "string", "minLength": 1 },
+    "sessionId": { "type": "string" },
+    "sessionName": { "type": "string" },
+    "cwd": { "type": "string", "minLength": 1 },
+    "targetCwd": {
+      "type": "string",
+      "description": "Где должен стартовать преемник. Отсутствует ⇒ = cwd."
+    },
+    "model": { "type": "string" },
+    "howToAsk": { "type": "string" },
+    "askCommand": { "type": "array", "items": { "type": "string" } },
+    "language": { "type": "string" },
+
+    "unit": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+      "description": "Имя линии. Отсутствует у безымянной линии — это легальное состояние. Из имени папки НЕ выводится."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Номер звена в линии, монотонно растёт. Ведётся инструментом, сравнивается потребителем."
+    },
+
+    "derived": {
+      "type": "object",
+      "description": "Факты, собранные кодом. Агент их не пишет и не правит. Всё — best effort: не собралось, значит поле опущено, запись не падает.",
+      "additionalProperties": false,
+      "properties": {
+        "branch": { "type": "string" },
+        "commits": { "type": "array", "items": { "type": "string" } },
+        "filesChanged": { "type": "array", "items": { "type": "string" } },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "endedAt": { "type": "string", "format": "date-time" },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "ok"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "ok": { "type": "boolean" },
+              "detail": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+
+    "goal": { "type": "string" },
+    "summary": { "type": "string" },
+    "nextStep": { "type": "string" },
+    "sessionTitle": { "type": "string" },
+    "blockers": { "type": "array", "items": { "type": "string" } },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["decision", "rationale"],
+        "additionalProperties": false,
+        "properties": {
+          "decision": { "type": "string" },
+          "rationale": { "type": "string" }
+        }
+      }
+    },
+    "filesChanged": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Авторское дополнение к derived.filesChanged — для того, чего git не видит."
+    },
+    "filesToRead": { "type": "array", "items": { "type": "string" } },
+    "environment": {
+      "oneOf": [
+        { "type": "array", "items": { "type": "string" } },
+        { "type": "object", "additionalProperties": { "type": "string" } }
+      ]
+    },
+    "deliberatelySkipped": { "type": "array", "items": { "type": "string" } },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["title", "body"],
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string" },
+          "body": { "type": "string" },
+          "files": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "contextNote": { "type": "string" },
+    "files": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Legacy, вытеснено filesToRead. Не удалять — v1 читается без потерь."
+    },
+
+    "externals": {
+      "type": "object",
+      "description": "Непрозрачные блоки внешних систем. session-link сюда не пишет сам и содержимое не интерпретирует.",
+      "additionalProperties": { "type": "object", "additionalProperties": true }
+    },
+
+    "committedAt": { "type": "string", "format": "date-time" },
+    "committedSessionFile": { "type": "string" },
+    "parentHandoffPath": {
+      "type": "string",
+      "description": "Абсолютный путь к неизменяемому архиву предка. Никогда не указывает на живой handoff.json."
+    }
+  }
+}
