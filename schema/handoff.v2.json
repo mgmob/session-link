@@ -66,9 +66,13 @@
       "description": "Факты, собранные кодом. Агент их не пишет и не правит. Всё — best effort: не собралось, значит поле опущено, запись не падает.",
       "additionalProperties": false,
       "properties": {
+        "baseRef": {
+          "type": "string",
+          "description": "HEAD на момент старта сессии — точка отсчёта для commits и filesChanged. Нет её — оба поля опускаются, а не заполняются приблизительно."
+        },
         "branch": { "type": "string" },
-        "commits": { "type": "array", "items": { "type": "string" } },
-        "filesChanged": { "type": "array", "items": { "type": "string" } },
+        "commits": { "type": "array", "items": { "type": "string" }, "description": "baseRef..HEAD" },
+        "filesChanged": { "type": "array", "items": { "type": "string" }, "description": "diff baseRef..HEAD + рабочее дерево" },
         "startedAt": { "type": "string", "format": "date-time" },
         "endedAt": { "type": "string", "format": "date-time" },
         "checks": {
