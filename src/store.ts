@@ -441,6 +441,12 @@ function tryAcquire(lockP: string): boolean {
 	}
 }
 
+/** Is the store's lock stale (dead owner / reused pid)? For /session-link-doctor.
+ *  Returns the stale owner, or null if no lock or it has a live owner. */
+export function isLockStale(store: string): LockContent | null {
+	return readStaleOwner(lockPath(store));
+}
+
 /** Read the lock; return the owner ONLY if stale (dead pid, or our pid with a
  *  different start time = pid reuse). A live owner or an unreadable lock → null. */
 function readStaleOwner(lockP: string): LockContent | null {

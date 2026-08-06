@@ -46,8 +46,11 @@
 import * as path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Handoff, StartMode } from "./types.ts";
-import { findHandoff, findHeadPath, handoffPath, markCommitted, readHandoff, validateHandoff, writeHandoff } from "./handoff.ts";
+import type { Handoff, HandoffV2, StartMode } from "./types.ts";
+import { findHandoff, findHeadPath, handoffPath, markCommitted, migrateLegacyHead, readHandoff, rebuildIndex, renameLine, validateHandoff, writeHandoff } from "./handoff.ts";
+import { resolveStore, withLock } from "./store.ts";
+import { renderGraph } from "./graph.ts";
+import { doctorReport, validateStore } from "./doctor.ts";
 import { querySession } from "./drivers/index.ts";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.SESSION_LINK_TIMEOUT_MS || 5 * 60 * 1000);
@@ -645,7 +648,15 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("session-link-show", {
 		description: "Show the current handoff for this project (path + spine status), if any.",
 		handler: async (_args, ctx) => {
-			const hp = findHeadPath(findHandoff(ctx.cwd));
+			const found = findHandoff(ctx.cwd);
+			if (found.kind === "ambiguous") {
+				const list = found.lines
+					.map((l) => `- ${l.unit}${l.unitProvisional ? " (provisional)" : ""} [${l.state} seq=${l.seq}] — ${l.nextStepFirstLine ?? ""}`)
+					.join("\n");
+				notify(ctx, `Несколько активных линий — укажите unit=:\n${list}`, "info");
+				return;
+			}
+			const hp = found.kind === "head" || found.kind === "legacy" ? found.path : undefined;
 			if (!hp) {
 				notify(ctx, `No handoff found at ${path.join(ctx.cwd, HANDOFF_DIR, "handoff.json")}`, "info");
 				return;
@@ -657,7 +668,78 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const v = validateHandoff(h);
 			const status = v.ok ? "ready (spine filled)" : `DRAFT (spine missing: ${v.missing.join(", ")})`;
-			notify(ctx, `Handoff: ${hp} — ${status} (driver=${h.driver}, session=${h.sessionId ?? h.sessionRef})`, "info");
+			let extra = "";
+			if (h.schema === "session-link/handoff/v2") {
+				const v2 = h as HandoffV2;
+				extra = ` · line=${v2.unit} seq=${v2.seq} state=${v2.lineState ?? "active"}${v2.unitProvisional ? " (provisional)" : ""}`;
+			}
+			notify(ctx, `Handoff: ${hp} — ${status} (driver=${h.driver}, session=${h.sessionId ?? h.sessionRef})${extra}`, "info");
+		},
+	});
+
+	// --- /session-link-name: name (or rename) the current line -------------------
+	pi.registerCommand("session-link-name", {
+		description:
+			"Name (or rename) the current line: /session-link-name <unit>. Moves <store>/<old>/ → <store>/<unit>/, clears unitProvisional.",
+		handler: async (args, ctx) => {
+			const unit = args.trim();
+			if (!unit) {
+				notify(ctx, "Usage: /session-link-name <unit>", "warning");
+				return;
+			}
+			const store = resolveStore(ctx.cwd).root;
+			try {
+				await withLock(store, () => {
+					const found = findHandoff(ctx.cwd);
+					if (found.kind === "head") {
+						renameLine(store, found.unit, unit);
+					} else if (found.kind === "legacy") {
+						migrateLegacyHead(ctx.cwd, { unit }); // migrate straight to the given name
+					} else {
+						throw new Error("нет текущей линии — сначала создайте handoff через /session-link");
+					}
+				});
+				notify(ctx, `Линия: "${unit}".`, "info");
+			} catch (e) {
+				notify(ctx, String((e as Error)?.message ?? e), "error");
+			}
+		},
+	});
+
+	// --- /session-link-graph: print the store graph (Mermaid) --------------------
+	pi.registerCommand("session-link-graph", {
+		description: "Print the store as a Mermaid graph: links are nodes, parent refs are edges.",
+		handler: async (_args, ctx) => {
+			const g = renderGraph(resolveStore(ctx.cwd).root);
+			notify(ctx, "```\n" + g + "```", "info");
+		},
+	});
+
+	// --- /session-link-doctor: diagnose / repair the store ----------------------
+	pi.registerCommand("session-link-doctor", {
+		description:
+			"Diagnose the store. Flags: --rebuild-index (rewrite index.json from heads), --validate (check files against the schema).",
+		handler: async (args, ctx) => {
+			const store = resolveStore(ctx.cwd).root;
+			const flags = args.trim() ? args.trim().split(/\s+/) : [];
+			try {
+				if (flags.includes("--rebuild-index")) {
+					await withLock(store, () => {
+						rebuildIndex(store);
+					});
+					notify(ctx, "index.json пересобран из голов линий.", "info");
+					return;
+				}
+				const report = flags.includes("--validate") ? validateStore(store) : doctorReport(store);
+				if (report.problems.length === 0) {
+					notify(ctx, flags.includes("--validate") ? "Все файлы прошли проверку." : "Store здоров — проблем нет.", "info");
+				} else {
+					const lines = report.problems.map((p) => `[${p.severity}] ${p.kind}: ${p.message}`);
+					notify(ctx, lines.join("\n"), flags.includes("--validate") ? "error" : "warning");
+				}
+			} catch (e) {
+				notify(ctx, String((e as Error)?.message ?? e), "error");
+			}
 		},
 	});
 
@@ -774,11 +856,17 @@ export default function (pi: ExtensionAPI): void {
 	// --- nudge: if a handoff is present when a fresh session starts ---------------
 	pi.on("session_start", async (event, ctx) => {
 		if (event.reason !== "new" && event.reason !== "startup") return;
-		const hp = findHeadPath(findHandoff(ctx.cwd));
-		if (!hp) return;
-		const h = readHandoff(hp);
-		if (h) {
-			notify(ctx, `Handoff available from a previous session (${h.driver}). Read it, or run /session-link-show.`, "info");
+		const found = findHandoff(ctx.cwd);
+		if (found.kind === "head") {
+			notify(ctx, `Handoff доступен: линия «${found.unit}». Прочитайте его или /session-link-show.`, "info");
+		} else if (found.kind === "legacy") {
+			notify(ctx, `Legacy handoff доступен (${found.path}). /session-link-show.`, "info");
+		} else if (found.kind === "ambiguous") {
+			// §4.3 nudge: list ≤5 active lines (updatedAt desc), hint how to see the rest.
+			const top = found.lines.slice(0, 5);
+			const more = found.lines.length > 5 ? `\n…и ещё ${found.lines.length - 5} — /session-link-show покажет все.` : "";
+			const list = top.map((l) => `- ${l.unit}${l.unitProvisional ? " (provisional)" : ""} [seq=${l.seq}]`).join("\n");
+			notify(ctx, `Несколько активных линий — выберите через unit=:\n${list}${more}`, "info");
 		}
 	});
 

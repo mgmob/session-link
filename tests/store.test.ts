@@ -120,12 +120,16 @@ test("generateId: matches the id pattern <YYYYMMDD>T<HHMMSSmmm>-<4hex>", () => {
 	}
 });
 
-test("generateId: repeated draws in a fresh store are all unique", () => {
+test("generateId: ids at different milliseconds are all distinct", () => {
 	const store = tmpProject();
 	try {
+		// Distinct `now` per draw ⇒ distinct timestamp prefix ⇒ distinct id. (Drawing
+		// many ids at the SAME millisecond relies on the 4-hex lottery and the
+		// birthday paradox — that path is covered by the collision-regen test instead.)
+		const base = Date.UTC(2026, 7, 5, 10, 0, 0);
 		const ids = new Set<string>();
-		for (let i = 0; i < 200; i++) ids.add(generateId(store));
-		assert.equal(ids.size, 200, "all generated ids are distinct");
+		for (let i = 0; i < 200; i++) ids.add(generateId(store, { now: new Date(base + i) }));
+		assert.equal(ids.size, 200, "ids at distinct ms are all distinct");
 	} finally {
 		rmrf(store);
 	}
