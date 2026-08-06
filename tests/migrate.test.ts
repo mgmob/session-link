@@ -13,7 +13,7 @@ import * as cp from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { convertV1ToV2Link, findHandoff, migrateLegacyHead, readHandoff, writeHandoff } from "../src/handoff.ts";
+import { convertV1ToV2Link, findHandoff, migrateLegacyHead, readHandoff } from "../src/handoff.ts";
 import { walkAncestors } from "../src/parent.ts";
 import { assignUnit, headPath, movedToPath, resolveStore, sluggifyHint, unitDir } from "../src/store.ts";
 import type { HandoffV1, HandoffV2 } from "../src/types.ts";
@@ -37,9 +37,22 @@ function v1Handoff(n: number): Record<string, unknown> {
 	};
 }
 
-/** Write a real v1 chain of `n` links into <cwd>/.pi/session_link via writeHandoff. */
+/** Write a real v1 chain of `n` links into <cwd>/.pi/session_link — emulating the
+ *  v0.1.0 writer (archive the previous head, set parentHandoffPath). */
 function writeV1Chain(cwd: string, n: number): void {
-	for (let i = 1; i <= n; i++) writeHandoff(cwd, v1Handoff(i) as unknown as HandoffV1);
+	const dir = path.join(cwd, ".pi", "session_link");
+	fs.mkdirSync(dir, { recursive: true });
+	const stamp = (iso: string) => iso.replace(/[:.]/g, "-");
+	for (let i = 1; i <= n; i++) {
+		const h = v1Handoff(i) as Record<string, unknown> & { parentHandoffPath?: string; createdAt: string };
+		const current = path.join(dir, "handoff.json");
+		if (fs.existsSync(current)) {
+			const archive = path.join(dir, `handoff-${stamp(h.createdAt)}.json`);
+			fs.copyFileSync(current, archive);
+			h.parentHandoffPath = archive;
+		}
+		fs.writeFileSync(current, JSON.stringify(h, null, 2) + "\n", "utf-8");
+	}
 }
 
 /** Non-git tmp project → store root = legacy dir = <cwd>/.pi/session_link. */

@@ -199,10 +199,6 @@ export function readHandoff(p: string): Handoff | undefined {
 	return obj as unknown as Handoff;
 }
 
-function stamp(iso: string): string {
-	return iso.replace(/[:.]/g, "-");
-}
-
 /** The mandatory spine — a handoff is "ready" to commit to a new session iff present. */
 export const SPINE_FIELDS = ["goal", "summary", "nextStep"] as const;
 
@@ -232,14 +228,6 @@ export function validateHandoff(h: Handoff | undefined): { ok: boolean; missing:
 	return { ok: missing.length === 0, missing };
 }
 
-/** Copy the agent-authored body fields from `src` onto `dst` (only keys that are present). */
-function mergeAgentBody(dst: Handoff, src: Handoff | undefined): void {
-	if (!src) return;
-	for (const k of AGENT_BODY_FIELDS) {
-		const v = (src as unknown as Record<string, unknown>)[k];
-		if (v !== undefined) (dst as unknown as Record<string, unknown>)[k] = v;
-	}
-}
 
 function mdEscapeInline(s: string): string {
 	return s;
@@ -389,52 +377,6 @@ export function toMarkdown(h: Handoff): string {
 	lines.push("```");
 	void mdEscapeInline;
 	return lines.join("\n");
-}
-
-/**
- * Write a handoff for a project.
- *
- * Chain / redo rules (so handoff files never corrupt):
- *   - handoff.json is the ONLY mutable file; the chain NEVER points at it.
- *   - If a live handoff exists from the SAME session (sameAuthor by sessionId),
- *     this is a REDO: overwrite in place, keep the existing parentHandoffPath,
- *     and carry forward any agent-authored body fields the agent already filled
- *     (a failed authoring pass must not wipe a good summary).
- *   - If a live handoff exists from a DIFFERENT session, this is a NEW handoff:
- *     archive the old live file to handoff-<stamp>.json and set parentHandoffPath
- *     to that immutable archive.
- *   - parentHandoffPath therefore always points at an archive (or is undefined),
- *     never at the live handoff.json — which also fixes the earlier self-link bug.
- *
- * Returns the path written.
- */
-export function writeHandoff(cwd: string, h: Handoff): string {
-	const dir = handoffDir(cwd);
-	fs.mkdirSync(dir, { recursive: true });
-
-	const current = handoffPath(cwd);
-	const existing = readHandoff(current);
-	const sameAuthor =
-		!!existing && !!h.sessionId && !!existing.sessionId && h.sessionId === existing.sessionId;
-
-	if (existing && !sameAuthor) {
-		// New handoff from a different author → archive + advance the chain.
-		const archive = path.join(dir, `handoff-${stamp(h.createdAt)}.json`);
-		try {
-			fs.copyFileSync(current, archive);
-			h.parentHandoffPath = archive;
-		} catch {
-			// archive is best-effort; chain link only set if the copy succeeded
-		}
-	} else if (existing && sameAuthor) {
-		// Redo in place: don't touch the chain, carry forward authored body.
-		h.parentHandoffPath = existing.parentHandoffPath;
-		mergeAgentBody(h, existing);
-	}
-
-	fs.writeFileSync(current, JSON.stringify(h, null, 2) + "\n", "utf-8");
-	fs.writeFileSync(path.join(dir, "handoff.md"), toMarkdown(h) + "\n", "utf-8");
-	return current;
 }
 
 /** Patch the live handoff's commit marker (best-effort) after a child session starts. */

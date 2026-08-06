@@ -4,9 +4,9 @@
  * Run on demand:  node tests/fixtures/v1-chain/generate.mjs
  * Output is committed (regenerate only when the v1 shape changes).
  *
- * The chain is produced by the REAL `writeHandoff` v1 (src/handoff.ts) so it
- * mirrors exactly what v0.1.0 writes on disk: head + N archives, each new
- * sessionId archiving the previous head. The only post-processing is making
+ * The chain is produced by EMULATING the v0.1.0 writer (the v1 writeHandoff was
+ * removed once v2 landed; this generator reproduces its on-disk shape — head +
+ * N archives, each new sessionId archiving the previous head). The only
  * `parentHandoffPath` portable: the live writer stores an absolute tmp path,
  * which would be machine-specific and break on commit. We rewrite it to the
  * basename of the archive sitting right next to it, keeping the chain
@@ -17,7 +17,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { writeHandoff } from "../../../src/handoff.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "v1chain-gen-"));
@@ -96,10 +95,23 @@ function build(s) {
 		environment: [`Node v22.23.2`, "OS: Linux x86_64"],
 	};
 }
+/** Emulate the v0.1.0 v1 writer: archive the previous head, set parentHandoffPath. */
+function writeV1(cwd, h) {
+	const dir = path.join(cwd, ".pi", "session_link");
+	fs.mkdirSync(dir, { recursive: true });
+	const stamp = (iso) => iso.replace(/[:.]/g, "-");
+	const current = path.join(dir, "handoff.json");
+	if (fs.existsSync(current)) {
+		const archive = path.join(dir, `handoff-${stamp(h.createdAt)}.json`);
+		fs.copyFileSync(current, archive);
+		h.parentHandoffPath = archive;
+	}
+	fs.writeFileSync(current, JSON.stringify(h, null, 2) + "\n", "utf-8");
+}
 
 try {
 	for (const s of SESSIONS) {
-		writeHandoff(TMP, build(s));
+		writeV1(TMP, build(s));
 	}
 
 	const srcDir = path.join(TMP, ".pi", "session_link");

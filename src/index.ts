@@ -35,7 +35,7 @@
  * Chain integrity: handoff.json is the ONLY mutable file; archives are immutable
  * and are the only thing parentHandoffPath ever points at. A redo from the same
  * session overwrites in place and carries the authored body forward. See
- * writeHandoff() in handoff.ts.
+ * writeLink() in handoff.ts.
  *
  * Portability: the invocation lives in the handoff's `askCommand` (an argv
  * template), so the next session never guesses platform flags. `driver` only
@@ -248,7 +248,7 @@ function buildAskCommand(absSessionFile: string | undefined, model: string | und
 
 /**
  * Build the envelope-only handoff. The agent authors the BODY afterwards (in the
- * authoring turn). On a redo from the same session, writeHandoff() merges the
+	 * authoring turn). On a redo from the same session, writeLink() merges the
  * previously-authored body forward so a failed pass doesn't wipe a good summary.
  */
 function buildEnvelope(pi: ExtensionAPI, ctx: ExtensionCommandContext, contextNote: string, langOverride?: string): WriteLinkInput {
