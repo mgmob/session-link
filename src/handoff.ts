@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { DerivedFacts, Handoff, HandoffV1, HandoffV2, LineState, ParentRef } from "./types.ts";
 import type { WithLockOptions } from "./store.ts";
-import { archivePath, assignUnit, collectDerived, deriveForkUnitName, generateId, headMdPath, headPath, indexPath, movedToPath, resolveStore, unitDir, validateUnit, withLock, UNIT_PATTERN } from "./store.ts";
+import { archivePath, assignUnit, collectDerived, deriveForkUnitName, generateId, headMdPath, headPath, indexPath, movedToPath, readIncoming, removeIncoming, resolveStore, unitDir, validateUnit, withLock, UNIT_PATTERN } from "./store.ts";
 import { resolveParent } from "./parent.ts";
 
 /** Directory where the handoff lives for a given project cwd. */
@@ -878,5 +878,53 @@ export function forkLine(
 
 	const result: WriteResult = { unit, id, seq, path: headPath(store, unit), caseName: "first-link", link };
 	persistLink(store, result);
+	return result;
+}
+
+/**
+ * Finish a cross-store relocation on the successor's first write (§2.6): read the
+ * `incoming/<unit>.json` pointer, create THIS store's first link of the line with
+ * `parent.store` pointing back at the source, then delete the pointer. The
+ * ancestor stays reachable via §2.5 cross-store resolution. Call under the lock.
+ * (Integrated into the starter flow in Э12.) */
+export function relocateFromIncoming(
+	store: string,
+	unit: string,
+	input: WriteLinkInput,
+	opts: WriteLinkOptions = {},
+): WriteResult {
+	const ptr = readIncoming(store, unit);
+	if (!ptr) throw new Error(`нет incoming-указателя для линии "${unit}" — переезжать нечего`);
+	const parentLink = readHandoff(ptr.head);
+	if (!parentLink || parentLink.schema !== "session-link/handoff/v2") {
+		throw new Error("переезд возможен только от v2-звена в источнике");
+	}
+	const p = parentLink as HandoffV2;
+	const id = generateId(store, { now: opts.now, hex: opts.hex });
+	const seq = p.seq + 1;
+	const parent: ParentRef = { id: ptr.id, unit: ptr.unit, seq: p.seq, store: ptr.store };
+	const derived = collectDerived(input.cwd, input.baseRef, input.startedAt);
+
+	const rest = { ...input } as Partial<WriteLinkInput>;
+	delete rest.baseRef;
+	delete rest.startedAt;
+	delete (rest as { unit?: string }).unit;
+	delete (rest as { targetCwd?: string }).targetCwd;
+
+	const link = {
+		...rest,
+		schema: "session-link/handoff/v2",
+		id,
+		unit: ptr.unit,
+		seq,
+		parent,
+		parentHandoffPath: ptr.head,
+		derived,
+	} as HandoffV2;
+	if (p.unitProvisional) link.unitProvisional = true;
+
+	const result: WriteResult = { unit: ptr.unit, id, seq, path: headPath(store, ptr.unit), caseName: "first-link", link };
+	persistLink(store, result);
+	removeIncoming(store, unit);
 	return result;
 }

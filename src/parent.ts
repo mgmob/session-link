@@ -62,11 +62,16 @@ export function resolveParent(parent: ParentRef, store: string, opts: ResolvePar
 	const archiveFile = `handoff-${parent.id}.json`;
 	const tried: string[] = [];
 
-	// Step 1 — one-shot hit using the unit hint in the current store.
+	// Step 1 — one-shot hit using the unit hint in the current store: archive,
+	//   or a LIVE head carrying the id (a parent may point at a current head).
 	if (parent.unit) {
-		const p = path.join(store, parent.unit, archiveFile);
-		tried.push(p);
-		if (fs.existsSync(p)) return { kind: "found", path: p, store, via: "direct" };
+		const archP = path.join(store, parent.unit, archiveFile);
+		tried.push(archP);
+		if (fs.existsSync(archP)) return { kind: "found", path: archP, store, via: "direct" };
+		const headP = path.join(store, parent.unit, "handoff.json");
+		if (fs.existsSync(headP) && headCarriesId(headP, parent.id)) {
+			return { kind: "found", path: headP, store, via: "direct" };
+		}
 	}
 
 	// Step 2 — scan the other unit dirs (rename case: dir changed, id didn't).
@@ -88,9 +93,13 @@ export function resolveParent(parent: ParentRef, store: string, opts: ResolvePar
 				continue;
 			}
 			if (parent.unit) {
-				const p = path.join(target, parent.unit, archiveFile);
-				tried.push(p);
-				if (fs.existsSync(p)) return { kind: "found", path: p, store: target, via: "cross-store", movedTo };
+				const archP = path.join(target, parent.unit, archiveFile);
+				tried.push(archP);
+				if (fs.existsSync(archP)) return { kind: "found", path: archP, store: target, via: "cross-store", movedTo };
+				const headP = path.join(target, parent.unit, "handoff.json");
+				if (fs.existsSync(headP) && headCarriesId(headP, parent.id)) {
+					return { kind: "found", path: headP, store: target, via: "cross-store", movedTo };
+				}
 			}
 			const scanned2 = scanForArchive(target, archiveFile);
 			if (scanned2) return { kind: "found", path: scanned2, store: target, via: "cross-store", movedTo };
@@ -106,6 +115,18 @@ export function resolveParent(parent: ParentRef, store: string, opts: ResolvePar
 
 	// Step 5 — honest miss.
 	return { kind: "notFound", id: parent.id, lastTriedPath: tried.length ? tried[tried.length - 1] : undefined };
+}
+
+/** Does the live head at `p` carry this link id? A parent may point at a LIVE
+ *  head (not just an archive) — e.g. a cross-store successor parents the source's
+ *  current head. §2.5 steps 1/3 check the head too. */
+function headCarriesId(p: string, id: string): boolean {
+	try {
+		const obj = JSON.parse(fs.readFileSync(p, "utf-8"));
+		return !!obj && obj.id === id;
+	} catch {
+		return false;
+	}
 }
 
 /** Scan `<store>/<unit>/handoff-<archiveFile>` across unit dirs; first hit or undefined. */

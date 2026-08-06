@@ -280,6 +280,51 @@ export function incomingPath(targetStoreRoot: string, unit: string): string {
 	return path.join(targetStoreRoot, "incoming", `${unit}.json`);
 }
 
+// ── Cross-store relocation pointer (§2.6) ──────────────────────────────────────
+// A session writes ONLY into its own store; into the TARGET it drops this
+// pointer. The successor finds it and finishes the move on its first write
+// (parent.store is filled → §2.5 cross-store resolution). Two-store transactions
+// are forbidden (two locks = deadlock), so this is the cheap hand-off.
+
+export interface IncomingPointer {
+	unit: string;
+	id: string;
+	/** Absolute path to the SOURCE head (`<source-store>/<unit>/handoff.json`). */
+	head: string;
+	/** Absolute path to the SOURCE store root — goes into the successor's `parent.store`. */
+	store: string;
+}
+
+/** Drop a relocation pointer into the target store (§2.6). */
+export function writeIncomingPointer(targetStore: string, info: IncomingPointer): string {
+	fs.mkdirSync(path.join(targetStore, "incoming"), { recursive: true });
+	const p = incomingPath(targetStore, info.unit);
+	fs.writeFileSync(p, JSON.stringify(info, null, 2) + "\n", "utf-8");
+	return p;
+}
+
+/** Read a relocation pointer for `unit`, if any. */
+export function readIncoming(store: string, unit: string): IncomingPointer | undefined {
+	try {
+		const obj = JSON.parse(fs.readFileSync(incomingPath(store, unit), "utf-8"));
+		if (obj && typeof obj === "object" && typeof obj.id === "string") return obj as IncomingPointer;
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Remove a relocation pointer (after the move is consumed). */
+export function removeIncoming(store: string, unit: string): void {
+	fs.rmSync(incomingPath(store, unit), { force: true });
+}
+
+/** Do `cwd` and `targetCwd` resolve to DIFFERENT stores? (§2.6 — only then is a
+ *  cross-store pointer needed; same-repo worktrees share one store.) */
+export function isCrossStore(cwd: string, targetCwd: string): boolean {
+	return resolveStore(cwd).root !== resolveStore(targetCwd).root;
+}
+
 // ── Derived facts (§7.3) ───────────────────────────────────────────────────
 // Best-effort git collection: any failure (not a repo, git missing) just omits
 // the field — collecting facts MUST NOT fail the write. `baseRef` gates
