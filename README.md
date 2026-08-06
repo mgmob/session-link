@@ -43,6 +43,35 @@ session is on its own. `session-link` adds two things:
 `/session-link-go` unattended. The default is `manual` (review-first).
 
 
+## v2: persistent lines & repo-scoped store
+
+Beyond the agent-authored body and back-channel above, v2 makes the **line of
+work** the persistent thing (a session is one attempt at advancing it):
+
+- **Repo-scoped store.** The handoff store lives at `<git-common-dir>/.pi/session_link`,
+  so every worktree of one clone shares it — a line started in one worktree is
+  visible from another with no network or daemon. Outside git it falls back to
+  `<cwd>/.pi/session_link`.
+- **Lines (`unit`) and identity.** Each line has a stable name (`unit`) and each
+  link an immutable `id`. Parent links are by `id`, not by path, so renames and
+  relocations never sever the chain. Unnamed lines get a technical name
+  (`u-…`, marked `unitProvisional`) — name them with `/session-link-name`.
+- **Three write cases (§5.1):** redo-in-place (same session rewrites its link,
+  body carried forward), a new link (different session archives the head,
+  advances `seq`), and the first link of a line.
+- **Derived facts (§7.3).** The tool collects `branch`, `commits`, `filesChanged`,
+  timings into `derived` — facts are collected, meaning is written. (`baseRef`,
+  fixed at session start, gates `commits`/`filesChanged`; `checks` are reserved
+  until a declarative source exists.)
+- **New commands:** `/session-link-name <unit>` (name/rename a line),
+  `/session-link-graph` (Mermaid of links and parent edges),
+  `/session-link-doctor [--rebuild-index|--validate]` (store diagnostics).
+- **Backwards compatible.** v1 handoffs read fine; on the first v2 write a
+  legacy head is migrated into the store (v1 archives stay put and stay
+  reachable). See `docs/handoff-v2-contract.md` for the normative contract and
+  `docs/handoff-v2-implementation-plan.md` for the staged plan.
+
+
 ## What's new in this version
 
 - **Agent-authored body.** The handoff now carries a structured **body**
