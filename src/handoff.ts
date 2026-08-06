@@ -440,13 +440,17 @@ export function writeHandoff(cwd: string, h: Handoff): string {
 /** Patch the live handoff's commit marker (best-effort) after a child session starts. */
 export function markCommitted(cwd: string, committedAt: string, committedSessionFile?: string): void {
 	try {
-		const p = handoffPath(cwd);
+		const p = findHeadPath(findHandoff(cwd));
+		if (!p) return;
 		const h = readHandoff(p);
 		if (!h) return;
 		h.committedAt = committedAt;
 		if (committedSessionFile) h.committedSessionFile = committedSessionFile;
+		const dir = path.dirname(p);     // <store>/<unit>/
+		const store = path.dirname(dir); // <store>
 		fs.writeFileSync(p, JSON.stringify(h, null, 2) + "\n", "utf-8");
-		fs.writeFileSync(path.join(handoffDir(cwd), "handoff.md"), toMarkdown(h) + "\n", "utf-8");
+		fs.writeFileSync(path.join(dir, "handoff.md"), toMarkdown(h) + "\n", "utf-8");
+		rebuildIndex(store);             // committedAt changed → index updatedAt would drift
 	} catch {
 		// commit marker is best-effort
 	}
