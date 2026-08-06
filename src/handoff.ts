@@ -702,8 +702,8 @@ function mergeBodyForward(dst: HandoffV2, src: HandoffV2): void {
 	}
 }
 
-/** Persist the link: head.json via temp+rename, then the .md projection.
- *  Data first; index.json is Э7. */
+/** Persist the link: head.json via temp+rename, the .md projection, then the
+ *  index. Data first, index last (§5) — a stale index is rebuilt, a lost head is not. */
 function persistLink(store: string, result: WriteResult): void {
 	const dir = unitDir(store, result.unit);
 	fs.mkdirSync(dir, { recursive: true });
@@ -712,4 +712,77 @@ function persistLink(store: string, result: WriteResult): void {
 	fs.writeFileSync(tmp, JSON.stringify(result.link, null, 2) + "\n", "utf-8");
 	fs.renameSync(tmp, finalPath);
 	fs.writeFileSync(headMdPath(store, result.unit), toMarkdown(result.link) + "\n", "utf-8");
+	// index last (§5): derived cache, rebuilt from heads — always recoverable.
+	rebuildIndex(store);
+}
+
+// ── index.json (§4) ──────────────────────────────────────────────────────────
+// The index is a DERIVED cache: fully rebuildable by walking <store>/*/head.
+// To make `--rebuild-index` byte-for-byte equal to the in-transaction update, both
+// paths go through `buildIndex` (sorted unit names, fixed field order).
+
+/** Build the canonical index by walking every line's head (§4). v1-only / unnamed
+ *  lines are skipped — they have no unit key. Deterministic: sorted unit names. */
+export function buildIndex(store: string): HandoffIndex {
+	const heads = new Map<string, HandoffV2>();
+	let dirs: fs.Dirent[];
+	try {
+		dirs = fs.readdirSync(store, { withFileTypes: true });
+	} catch {
+		return { schema: "session-link/index/v1", units: {} };
+	}
+	for (const e of dirs) {
+		if (!e.isDirectory() || e.name === "incoming") continue;
+		const h = readHandoff(headPath(store, e.name));
+		if (h && h.schema === "session-link/handoff/v2") heads.set(e.name, h as HandoffV2);
+	}
+	const units: Record<string, IndexEntry> = {};
+	for (const unit of [...heads.keys()].sort()) {
+		units[unit] = buildIndexEntry(store, unit, heads.get(unit)!);
+	}
+	return { schema: "session-link/index/v1", units };
+}
+
+/** Build one index entry from a head (§4): head path relative to store, sessions
+ *  counts the line's v2 links in the store, state mirrors the head's lineState. */
+function buildIndexEntry(store: string, unit: string, head: HandoffV2): IndexEntry {
+	const entry: IndexEntry = {
+		head: `${unit}/handoff.json`,
+		updatedAt: head.committedAt ?? head.createdAt,
+		sessions: countSessions(store, unit),
+		state: head.lineState ?? "active",
+		cwd: head.cwd,
+	};
+	if (head.unitProvisional) entry.unitProvisional = true;
+	return entry;
+}
+
+/** Number of v2 links of a line in the store: archives in <unit>/ + the head. */
+function countSessions(store: string, unit: string): number {
+	try {
+		const files = fs.readdirSync(unitDir(store, unit));
+		const archives = files.filter((f) => /^handoff-.*\.json$/.test(f)).length;
+		return archives + 1;
+	} catch {
+		return 1;
+	}
+}
+
+/** Serialize the index atomically (temp + rename). Deterministic given the same
+ *  object (fixed key order: schema, units; units in insertion = sorted order). */
+export function writeIndex(store: string, index: HandoffIndex): void {
+	fs.mkdirSync(store, { recursive: true });
+	const p = indexPath(store);
+	const tmp = p + ".tmp";
+	fs.writeFileSync(tmp, JSON.stringify(index, null, 2) + "\n", "utf-8");
+	fs.renameSync(tmp, p);
+}
+
+/** Rebuild index.json from the live heads and return it (§4). Byte-for-byte
+ *  identical to what writeLink leaves behind, because writeLink updates the index
+ *  by calling THIS function — same path, same serialization. */
+export function rebuildIndex(store: string): HandoffIndex {
+	const index = buildIndex(store);
+	writeIndex(store, index);
+	return index;
 }
