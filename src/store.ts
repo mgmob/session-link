@@ -30,6 +30,29 @@ export const ID_PATTERN = /^[0-9]{8}T[0-9]{9}-[0-9a-f]{4}$/;
  *  Strict — no silent normalization; a violation is rejected with a sluggify hint. */
 export const UNIT_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
+/** Windows-reserved names (§3.1): a dir of this name can't be created on Windows.
+ *  Case- and extension-insensitive — "CON", "con.txt" are both blocked. */
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+
+export interface UnitCheck {
+	ok: boolean;
+	/** Human-readable reason when not ok (used verbatim in the rejection). */
+	reason?: string;
+	/** A sluggified suggestion, when one can be derived from the input. */
+	suggestion?: string;
+}
+
+/** Validate a line name strictly (§3.1): UNIT_PATTERN + Windows-reserved. */
+export function validateUnit(name: string): UnitCheck {
+	if (!UNIT_PATTERN.test(name)) {
+		return { ok: false, reason: `разрешено [a-z0-9][a-z0-9-]{0,63}`, suggestion: sluggifyHint(name) };
+	}
+	if (WINDOWS_RESERVED.test(name)) {
+		return { ok: false, reason: `имя зарезервировано в Windows` };
+	}
+	return { ok: true };
+}
+
 export interface ResolvedStore {
 	/** Absolute path to the store root (`<root>/.pi/session_link`). */
 	root: string;
@@ -178,16 +201,16 @@ export interface AssignedUnit {
  */
 export function assignUnit(opts: AssignUnitOptions): AssignedUnit {
 	if (opts.given !== undefined && opts.given !== "") {
-		if (!UNIT_PATTERN.test(opts.given)) {
-			throw new Error(
-				`unit "${opts.given}" недопустим: разрешено [a-z0-9][a-z0-9-]{0,63}. ` +
-					`Возможно, имелось в виду "${sluggifyHint(opts.given)}».`,
-			);
+		const check = validateUnit(opts.given);
+		if (!check.ok) {
+			const hint = check.suggestion ? ` Возможно, имелось в виду "${check.suggestion}».` : "";
+			throw new Error(`unit "${opts.given}" недопустим: ${check.reason}.${hint}`);
 		}
 		return { unit: opts.given, provisional: false };
 	}
-	if (opts.parentUnit && UNIT_PATTERN.test(opts.parentUnit)) {
-		return { unit: opts.parentUnit, provisional: false };
+	if (opts.parentUnit) {
+		const inherited = validateUnit(opts.parentUnit);
+		if (inherited.ok) return { unit: opts.parentUnit, provisional: false };
 	}
 	return { unit: technicalUnit(opts.now ?? new Date(), opts.hex), provisional: true };
 }
@@ -208,6 +231,16 @@ export function sluggifyHint(name: string): string {
 	// ensure a leading alnum (UNIT_PATTERN requires it)
 	const fixed = /^[a-z0-9]/.test(s) ? s : `n-${s}`;
 	return fixed.slice(0, 64);
+}
+
+/** Derive the next free fork name `<baseUnit>-b2`, `-b3`, … (§6). The base line
+ *  stays put; the fork is a new directory. Occupied names are skipped, never reused. */
+export function deriveForkUnitName(store: string, baseUnit: string): string {
+	for (let n = 2; n <= 1024; n++) {
+		const candidate = `${baseUnit}-b${n}`;
+		if (!fs.existsSync(unitDir(store, candidate))) return candidate;
+	}
+	return `${baseUnit}-b2-${Date.now().toString(36)}`;
 }
 
 

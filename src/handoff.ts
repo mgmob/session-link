@@ -2,7 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { DerivedFacts, Handoff, HandoffV1, HandoffV2, LineState, ParentRef } from "./types.ts";
 import type { WithLockOptions } from "./store.ts";
-import { archivePath, assignUnit, collectDerived, generateId, headMdPath, headPath, indexPath, movedToPath, resolveStore, unitDir, withLock, UNIT_PATTERN } from "./store.ts";
+import { archivePath, assignUnit, collectDerived, deriveForkUnitName, generateId, headMdPath, headPath, indexPath, movedToPath, resolveStore, unitDir, validateUnit, withLock, UNIT_PATTERN } from "./store.ts";
+import { resolveParent } from "./parent.ts";
 
 /** Directory where the handoff lives for a given project cwd. */
 export function handoffDir(cwd: string): string {
@@ -785,4 +786,97 @@ export function rebuildIndex(store: string): HandoffIndex {
 	const index = buildIndex(store);
 	writeIndex(store, index);
 	return index;
+}
+
+// ── rename / fork (§3.2, §6) ───────────────────────────────────────────────────
+
+export interface RenameResult {
+	unit: string;
+	path: string;
+}
+
+/**
+ * Rename a line (§2.5/§3, the /session-link-name action): move `<store>/<old>/` →
+ * `<store>/<new>/`, set the head's `unit` and clear `unitProvisional` (operator
+ * confirmed it), rebuild the index. Archives move WITH the dir but their contents
+ * are byte-identical and links are NOT rewritten — safe by §2.5 (resolution scans
+ * by id, step 2). Call under the store lock (a command would wrap this in withLock).
+ */
+export function renameLine(store: string, oldUnit: string, newUnit: string): RenameResult {
+	const check = validateUnit(newUnit);
+	if (!check.ok) {
+		const hint = check.suggestion ? ` Возможно, имелось в виду "${check.suggestion}».` : "";
+		throw new Error(`unit "${newUnit}" недопустим: ${check.reason}.${hint}`);
+	}
+	if (oldUnit === newUnit) throw new Error(`новое имя совпадает со старым: "${oldUnit}"`);
+	const oldDir = unitDir(store, oldUnit);
+	const newDir = unitDir(store, newUnit);
+	if (!fs.existsSync(oldDir)) throw new Error(`линия "${oldUnit}" не найдена в store`);
+	if (fs.existsSync(newDir)) throw new Error(`линия "${newUnit}" уже существует`);
+
+	// Move the whole dir — head + archives travel together; their bytes don't change.
+	fs.renameSync(oldDir, newDir);
+
+	// Head: adopt the new name, clear provisional (the operator confirmed it).
+	const headP = headPath(store, newUnit);
+	const head = readHandoff(headP);
+	if (head && head.schema === "session-link/handoff/v2") {
+		const v2 = head as HandoffV2;
+		v2.unit = newUnit;
+		delete v2.unitProvisional;
+		fs.writeFileSync(headP, JSON.stringify(v2, null, 2) + "\n", "utf-8");
+		fs.writeFileSync(headMdPath(store, newUnit), toMarkdown(v2) + "\n", "utf-8");
+	}
+
+	rebuildIndex(store);
+	return { unit: newUnit, path: headP };
+}
+
+/**
+ * Fork a line off an arbitrary ancestor (§6): the recorded `parent` ≠ the line's
+ * head. A new derived line `<baseUnit>-b2` (next free suffix) is created whose
+ * first link parents the given ancestor; seq starts at parent.seq+1 (§7.2). The
+ * fork is provisional and marked so the operator is prompted to name it. Call
+ * under the store lock. (Integrated into the go-fork flow in Э9.)
+ */
+export function forkLine(
+	store: string,
+	parentRef: ParentRef,
+	input: WriteLinkInput,
+	opts: WriteLinkOptions = {},
+): WriteResult {
+	const resolved = resolveParent(parentRef, store);
+	if (resolved.kind !== "found") {
+		throw new Error(`невозможно ветвление: предок не найден (id ${parentRef.id})`);
+	}
+	const parentLink = readHandoff(resolved.path);
+	if (!parentLink || parentLink.schema !== "session-link/handoff/v2") {
+		throw new Error("ветвление возможно только от v2-звена");
+	}
+	const p = parentLink as HandoffV2;
+	const unit = deriveForkUnitName(store, p.unit);
+	const id = generateId(store, { now: opts.now, hex: opts.hex });
+	const seq = p.seq + 1;
+	const derived = collectDerived(input.cwd, input.baseRef, input.startedAt);
+
+	const rest = { ...input } as Partial<WriteLinkInput>;
+	delete rest.baseRef;
+	delete rest.startedAt;
+	delete (rest as { unit?: string }).unit;
+
+	const link = {
+		...rest,
+		schema: "session-link/handoff/v2",
+		id,
+		unit,
+		seq,
+		parent: parentRef,
+		parentHandoffPath: resolved.path,
+		derived,
+		unitProvisional: true,
+	} as HandoffV2;
+
+	const result: WriteResult = { unit, id, seq, path: headPath(store, unit), caseName: "first-link", link };
+	persistLink(store, result);
+	return result;
 }
