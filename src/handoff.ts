@@ -553,6 +553,61 @@ export interface WriteLinkOptions {
 	now?: Date;
 	hex?: () => string;
 	lock?: WithLockOptions;
+	/** Sink for best-effort notices (e.g. an externals block dropped as fail-soft). */
+	log?: (msg: string) => void;
+}
+
+// ── externals (§8) ─────────────────────────────────────────────────────────────
+// Opaque blocks the tool stores verbatim and never interprets. A block over the
+// ceiling is a HARD refusal (named, not silently truncated); a block that can't
+// be serialized is dropped (fail-soft) and the write proceeds without it.
+
+/** Per-block byte ceiling (recommended 32 KB, §8). */
+export const EXTERNALS_BLOCK_LIMIT = 32 * 1024;
+
+export interface ExternalsViolation {
+	key: string;
+	bytes: number;
+}
+
+/** Check externals block sizes (§8). Returns oversize blocks (hard refusal) and
+ *  unserializable ones (fail-soft drop). Absent/empty externals ⇒ clean. */
+export function checkExternals(externals: Record<string, unknown> | undefined): {
+	violations: ExternalsViolation[];
+	unserializable: string[];
+} {
+	const violations: ExternalsViolation[] = [];
+	const unserializable: string[] = [];
+	if (!externals) return { violations, unserializable };
+	for (const [key, block] of Object.entries(externals)) {
+		let serialized: string;
+		try {
+			serialized = JSON.stringify(block);
+		} catch {
+			unserializable.push(key);
+			continue;
+		}
+		const bytes = Buffer.byteLength(serialized, "utf-8");
+		if (bytes > EXTERNALS_BLOCK_LIMIT) violations.push({ key, bytes });
+	}
+	return { violations, unserializable };
+}
+
+/** Enforce externals limits on a built link (§8): throw on an oversize block,
+ *  drop unserializable blocks (fail-soft, logged). */
+function sanitizeExternals(link: HandoffV2, log: (msg: string) => void): void {
+	if (!link.externals) return;
+	const check = checkExternals(link.externals);
+	if (check.violations.length) {
+		const v = check.violations[0];
+		throw new Error(
+			`блок externals["${v.key}"] — ${v.bytes} байт при лимите ${EXTERNALS_BLOCK_LIMIT}. Сократите блок; handoff не записан.`,
+		);
+	}
+	for (const key of check.unserializable) {
+		delete (link.externals as Record<string, unknown>)[key];
+		log(`session-link: externals["${key}"] не сериализуется — блок опущен (handoff записан без него).`);
+	}
 }
 
 /**
@@ -585,6 +640,7 @@ export async function writeLink(
 
 			const head = locateHead(store, input.unit);
 			const result = buildLink(store, input, head, derived, opts);
+			sanitizeExternals(result.link, opts.log ?? (() => {}));
 			persistLink(store, result);
 			return result;
 		},
