@@ -1,0 +1,41 @@
+{
+  "schema": "session-link/handoff/v1",
+  "createdAt": "2026-07-01T09:00:00.000Z",
+  "driver": "pi",
+  "sessionRef": "/home/omr/.pi/agent/sessions/11111111-1111-4111-8111-111111111111.jsonl",
+  "sessionId": "11111111-1111-4111-8111-111111111111",
+  "sessionName": "omr-foundation-1",
+  "cwd": "/home/omr/projects/omr",
+  "model": "zai-coding-cn/glm-5.2",
+  "howToAsk": "printf '%s' \"<your question>\" | pi --mode json --session /home/omr/.pi/agent/sessions/11111111-1111-4111-8111-111111111111.jsonl --tools read,grep,find,ls --model zai-coding-cn/glm-5.2",
+  "askCommand": [
+    "pi",
+    "--mode",
+    "json",
+    "--session",
+    "/home/omr/.pi/agent/sessions/11111111-1111-4111-8111-111111111111.jsonl",
+    "--tools",
+    "read,grep,find,ls",
+    "--model",
+    "zai-coding-cn/glm-5.2"
+  ],
+  "language": "Russian",
+  "goal": "Подвести фундамент проекта OMR: репозиторий, схема данных, конфигурация.",
+  "summary": "Заведён репозиторий, базовая структура каталогов, README и tsconfig.",
+  "nextStep": "Описать схему данных и завести миграции.",
+  "sessionTitle": "OMR: фундамент #1",
+  "decisions": [
+    {
+      "decision": "Стек: Node 22 + TypeScript + node:test",
+      "rationale": "Знаком команде; встроенный test-runner, новых зависимостей нет."
+    }
+  ],
+  "filesToRead": [
+    "src/config.ts",
+    "README.md"
+  ],
+  "environment": [
+    "Node v22.23.2",
+    "OS: Linux x86_64"
+  ]
+}

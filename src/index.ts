@@ -35,7 +35,7 @@
  * Chain integrity: handoff.json is the ONLY mutable file; archives are immutable
  * and are the only thing parentHandoffPath ever points at. A redo from the same
  * session overwrites in place and carries the authored body forward. See
- * writeHandoff() in handoff.ts.
+ * writeLink() in handoff.ts.
  *
  * Portability: the invocation lives in the handoff's `askCommand` (an argv
  * template), so the next session never guesses platform flags. `driver` only
@@ -43,11 +43,16 @@
  * claude-code / qwen (author their handoff in the same JSON schema).
  */
 
+import * as cp from "node:child_process";
 import * as path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Handoff, StartMode } from "./types.ts";
-import { findHandoff, handoffPath, markCommitted, readHandoff, validateHandoff, writeHandoff } from "./handoff.ts";
+import type { Handoff, HandoffV2, StartMode } from "./types.ts";
+import type { WriteLinkInput } from "./handoff.ts";
+import { findHandoff, findHeadPath, handoffPath, markCommitted, migrateLegacyHead, readHandoff, rebuildIndex, renameLine, validateHandoff, writeLink } from "./handoff.ts";
+import { resolveStore, withLock } from "./store.ts";
+import { renderGraph } from "./graph.ts";
+import { doctorReport, validateStore } from "./doctor.ts";
 import { querySession } from "./drivers/index.ts";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.SESSION_LINK_TIMEOUT_MS || 5 * 60 * 1000);
@@ -55,7 +60,6 @@ const PI_TOOLS_ALLOWLIST = process.env.SESSION_LINK_PI_TOOLS || "read,grep,find,
 const PI_BIN = process.env.SESSION_LINK_PI_BIN || process.env.PI_BIN || "pi";
 const DEFAULT_START_MODE = (process.env.SESSION_LINK_DEFAULT_MODE || "manual") === "auto" ? "auto" : "manual";
 
-const HANDOFF_SCHEMA = "session-link/handoff/v1";
 const HANDOFF_DIR = path.join(".pi", "session_link");
 
 const LANG_CODE_MAP: Record<string, string> = {
@@ -107,6 +111,27 @@ function deriveSessionId(sessionFile: string | undefined): string | undefined {
 	const m = path.basename(sessionFile).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
 	return m ? m[1] : undefined;
 }
+
+/** Current HEAD sha of `cwd`, or undefined if not a git repo / git unavailable.
+ *  Captured at session start as the `baseRef` for derived commits/filesChanged (§7.3). */
+function gitHead(cwd: string): string | undefined {
+	try {
+		const r = cp.spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf-8" });
+		if (r.status !== 0 || r.error) return undefined;
+		const s = (r.stdout || "").trim();
+		return /^[0-9a-f]{7,40}$/.test(s) ? s : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Per-session facts captured at session_start: the baseRef (HEAD at start) and
+ *  startedAt timestamp — fed into the v2 envelope at /session-link time. */
+interface SessionStartFacts {
+	baseRef?: string;
+	startedAt: string;
+}
+const sessionStartFacts = new Map<string, SessionStartFacts>();
 
 /** Markers for messages injected by our own code via pi.sendUserMessage — never real user text,
  *  so they must not influence language detection (they are authored in English). */
@@ -223,16 +248,16 @@ function buildAskCommand(absSessionFile: string | undefined, model: string | und
 
 /**
  * Build the envelope-only handoff. The agent authors the BODY afterwards (in the
- * authoring turn). On a redo from the same session, writeHandoff() merges the
+	 * authoring turn). On a redo from the same session, writeLink() merges the
  * previously-authored body forward so a failed pass doesn't wipe a good summary.
  */
-function buildEnvelope(pi: ExtensionAPI, ctx: ExtensionCommandContext, contextNote: string, langOverride?: string): Handoff {
+function buildEnvelope(pi: ExtensionAPI, ctx: ExtensionCommandContext, contextNote: string, langOverride?: string): WriteLinkInput {
 	const sessionFile = ctx.sessionManager.getSessionFile();
 	const abs = sessionFile ? path.resolve(sessionFile) : undefined;
 	const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 	const { argv, human } = buildAskCommand(abs, model);
+	const facts = sessionFile ? sessionStartFacts.get(sessionFile) : undefined;
 	return {
-		schema: HANDOFF_SCHEMA,
 		createdAt: new Date().toISOString(),
 		driver: "pi",
 		sessionRef: abs ?? deriveSessionId(sessionFile) ?? "unknown",
@@ -244,21 +269,23 @@ function buildEnvelope(pi: ExtensionAPI, ctx: ExtensionCommandContext, contextNo
 		howToAsk: human,
 		askCommand: argv,
 		contextNote: contextNote.trim() || undefined,
+		baseRef: facts?.baseRef,
+		startedAt: facts?.startedAt,
 	};
 }
 
 /** The thin starter prompt the NEXT session receives. Lives in code; the only
  *  variable is the handoff file path. The agent never authors this. */
-function buildStarterPrompt(handoffFile: string, language?: string): string {
+function buildStarterPrompt(handoffFile: string, opts: { language?: string; unitProvisional?: boolean } = {}): string {
 	const lines: string[] = [];
 	lines.push("# Context handoff (auto-started by /session-link)");
-	if (language) {
+	if (opts.language) {
 		// Prominent + at the very top: this prompt is English, so an explicit
 		// instruction here is what keeps the new session in the user's language.
 		lines.push("");
 		lines.push(
 			"> LANGUAGE: Communicate with me in **" +
-				language +
+				opts.language +
 				"** throughout this entire session — every status update, understanding report, and summary. Match the user's language; do not switch to English unless I do.",
 		);
 	}
@@ -268,7 +295,7 @@ function buildStarterPrompt(handoffFile: string, language?: string): string {
 	lines.push("");
 	lines.push("Proceed now:");
 	lines.push("1. Call the `current_session` tool to confirm your identity.");
-	lines.push("2. Read the handoff file. Its body fields (`goal`, `summary`, `nextStep`, plus any `blockers`/`decisions`/`filesToRead`/`sections`) ARE the context — start there, not at the envelope.");
+	lines.push("2. Read the handoff file. Its body fields (`goal`, `summary`, `nextStep`, plus any `blockers`/`decisions`/`filesToRead`/`sections`) ARE the context — start there, not at the envelope. The `derived` block (branch/commits/filesChanged) is CODE-collected facts — read them as facts, the agent didn't author them.");
 	lines.push("3. Read every file in the handoff's `filesToRead` (and anything cited in `summary`/`nextStep`).");
 	lines.push("4. For the actual current state of changed files, trust GIT over the handoff's `filesChanged` (that list is only a reading hint and can drift across uncommitted sessions): run `git diff HEAD` (uncommitted) and `git diff <merge-base/main>..HEAD` (committed) to see the complete current file state. The handoff's `summary`/`sections` carry the INTENT; git carries the line-level truth.");
 	lines.push("5. Report your understanding of the context, concisely.");
@@ -276,6 +303,11 @@ function buildStarterPrompt(handoffFile: string, language?: string): string {
 	lines.push('   - If `session_link` returns `kind: "clarification"`, show those questions to me, collect my answers, then call it again with `clarifications: [...]`.');
 	lines.push("   - You may call `session_link` multiple times; each round is appended to the previous session, so it remembers earlier answers.");
 	lines.push('7. Once you have the context (and any real uncertainties are resolved), report "context accepted" with a short summary — state explicitly whether there were uncertainties to chase down — then wait for my next instruction. Do not query the previous session just for the sake of it.');
+	lines.push("");
+	if (opts.unitProvisional) {
+		lines.push("");
+		lines.push("> The line has a PROVISIONAL technical name — give it a real one with `/session-link-name <unit>`.");
+	}
 	lines.push("");
 	lines.push("Narrate each step so I can follow along.");
 	return lines.join("\n");
@@ -298,6 +330,13 @@ function buildAuthorPrompt(handoffFile: string, starterPrompt: string, language:
 	lines.push("");
 	lines.push(
 		"Why this matters: earlier handoffs contained only a transcript of the USER's messages, not what YOU did. Lead with your work and reasoning.",
+	);
+	lines.push("");
+	lines.push(
+		"Code-owned fields — DO NOT author or edit: `schema`, `id`, `parent`, `seq`, `unit`, `unitProvisional`, `lineState`, `derived`, `targetCwd`, and the envelope (`sessionRef`/`askCommand`/`driver`/`cwd`/timestamps). The `derived` facts (branch, commits, filesChanged) are COLLECTED by the tool — facts are collected, meaning is written; comment on a fact if you must, never rewrite it.",
+	);
+	lines.push(
+		"If the line carries `unitProvisional: true`, suggest the operator name it via `/session-link-name <unit>`.",
 	);
 	lines.push("");
 	lines.push("## Step 1 — author the body");
@@ -536,10 +575,12 @@ export default function (pi: ExtensionAPI): void {
 
 			const envelope = buildEnvelope(pi, ctx, note, lang);
 			const parentSession = ctx.sessionManager.getSessionFile() ?? undefined;
-			const handoffFile = writeHandoff(ctx.cwd, envelope);
-			notify(ctx, `Handoff envelope written: ${handoffFile} (mode: ${mode}, language: ${envelope.language ?? "undetected"})`, "info");
+			const writeResult = await writeLink(ctx.cwd, envelope);
+			const handoffFile = writeResult.path;
+			const provNote = writeResult.link.unitProvisional ? `; provisional name "${writeResult.unit}" — /session-link-name` : "";
+			notify(ctx, `Handoff written: ${handoffFile} (line: ${writeResult.unit}, seq: ${writeResult.seq}${provNote}; mode: ${mode}, language: ${envelope.language ?? "undetected"})`, "info");
 
-			const starterPrompt = buildStarterPrompt(handoffFile, envelope.language);
+			const starterPrompt = buildStarterPrompt(handoffFile, { language: envelope.language, unitProvisional: writeResult.link.unitProvisional });
 			const authorPrompt = buildAuthorPrompt(handoffFile, starterPrompt, envelope.language, mode);
 			sendAuthorTurn(pi, ctx, authorPrompt);
 
@@ -583,7 +624,7 @@ export default function (pi: ExtensionAPI): void {
 				notify(ctx, "session-link-go requires interactive (TUI) mode", "error");
 				return;
 			}
-			const hp = findHandoff(ctx.cwd);
+			const hp = findHeadPath(findHandoff(ctx.cwd));
 			if (!hp) {
 				notify(ctx, `No handoff found at ${path.join(ctx.cwd, HANDOFF_DIR, "handoff.json")}. Run /session-link first.`, "warning");
 				return;
@@ -612,7 +653,7 @@ export default function (pi: ExtensionAPI): void {
 				);
 			}
 			const parentSession = ctx.sessionManager.getSessionFile() ?? undefined;
-			const starterPrompt = buildStarterPrompt(hp, h.language);
+			const starterPrompt = buildStarterPrompt(hp, { language: h.language, unitProvisional: (h as HandoffV2).unitProvisional });
 			const cwd = ctx.cwd;
 			const title = nameClosingSession(pi, h);
 			const committedAt = new Date().toISOString();
@@ -632,9 +673,11 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const { lang, note } = parseStartArgs(args);
 			const envelope = buildEnvelope(pi, ctx, note, lang);
-			const handoffFile = writeHandoff(ctx.cwd, envelope);
-			notify(ctx, `Handoff envelope written: ${handoffFile} (language: ${envelope.language ?? "undetected"})`, "info");
-			const starterPrompt = buildStarterPrompt(handoffFile, envelope.language);
+			const writeResult = await writeLink(ctx.cwd, envelope);
+			const handoffFile = writeResult.path;
+			const provNote = writeResult.link.unitProvisional ? `; provisional name "${writeResult.unit}" — /session-link-name` : "";
+			notify(ctx, `Handoff written: ${handoffFile} (line: ${writeResult.unit}, seq: ${writeResult.seq}${provNote}; language: ${envelope.language ?? "undetected"})`, "info");
+			const starterPrompt = buildStarterPrompt(handoffFile, { language: envelope.language, unitProvisional: writeResult.link.unitProvisional });
 			const authorPrompt = buildAuthorPrompt(handoffFile, starterPrompt, envelope.language, "manual");
 			sendAuthorTurn(pi, ctx, authorPrompt);
 			notify(ctx, "Authoring turn started in this session. Review, then /session-link-go when ready.", "info");
@@ -645,7 +688,15 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("session-link-show", {
 		description: "Show the current handoff for this project (path + spine status), if any.",
 		handler: async (_args, ctx) => {
-			const hp = findHandoff(ctx.cwd);
+			const found = findHandoff(ctx.cwd);
+			if (found.kind === "ambiguous") {
+				const list = found.lines
+					.map((l) => `- ${l.unit}${l.unitProvisional ? " (provisional)" : ""} [${l.state} seq=${l.seq}] — ${l.nextStepFirstLine ?? ""}`)
+					.join("\n");
+				notify(ctx, `Несколько активных линий — укажите unit=:\n${list}`, "info");
+				return;
+			}
+			const hp = found.kind === "head" || found.kind === "legacy" ? found.path : undefined;
 			if (!hp) {
 				notify(ctx, `No handoff found at ${path.join(ctx.cwd, HANDOFF_DIR, "handoff.json")}`, "info");
 				return;
@@ -657,7 +708,78 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const v = validateHandoff(h);
 			const status = v.ok ? "ready (spine filled)" : `DRAFT (spine missing: ${v.missing.join(", ")})`;
-			notify(ctx, `Handoff: ${hp} — ${status} (driver=${h.driver}, session=${h.sessionId ?? h.sessionRef})`, "info");
+			let extra = "";
+			if (h.schema === "session-link/handoff/v2") {
+				const v2 = h as HandoffV2;
+				extra = ` · line=${v2.unit} seq=${v2.seq} state=${v2.lineState ?? "active"}${v2.unitProvisional ? " (provisional)" : ""}`;
+			}
+			notify(ctx, `Handoff: ${hp} — ${status} (driver=${h.driver}, session=${h.sessionId ?? h.sessionRef})${extra}`, "info");
+		},
+	});
+
+	// --- /session-link-name: name (or rename) the current line -------------------
+	pi.registerCommand("session-link-name", {
+		description:
+			"Name (or rename) the current line: /session-link-name <unit>. Moves <store>/<old>/ → <store>/<unit>/, clears unitProvisional.",
+		handler: async (args, ctx) => {
+			const unit = args.trim();
+			if (!unit) {
+				notify(ctx, "Usage: /session-link-name <unit>", "warning");
+				return;
+			}
+			const store = resolveStore(ctx.cwd).root;
+			try {
+				await withLock(store, () => {
+					const found = findHandoff(ctx.cwd);
+					if (found.kind === "head") {
+						renameLine(store, found.unit, unit);
+					} else if (found.kind === "legacy") {
+						migrateLegacyHead(ctx.cwd, { unit }); // migrate straight to the given name
+					} else {
+						throw new Error("нет текущей линии — сначала создайте handoff через /session-link");
+					}
+				});
+				notify(ctx, `Линия: "${unit}".`, "info");
+			} catch (e) {
+				notify(ctx, String((e as Error)?.message ?? e), "error");
+			}
+		},
+	});
+
+	// --- /session-link-graph: print the store graph (Mermaid) --------------------
+	pi.registerCommand("session-link-graph", {
+		description: "Print the store as a Mermaid graph: links are nodes, parent refs are edges.",
+		handler: async (_args, ctx) => {
+			const g = renderGraph(resolveStore(ctx.cwd).root);
+			notify(ctx, "```\n" + g + "```", "info");
+		},
+	});
+
+	// --- /session-link-doctor: diagnose / repair the store ----------------------
+	pi.registerCommand("session-link-doctor", {
+		description:
+			"Diagnose the store. Flags: --rebuild-index (rewrite index.json from heads), --validate (check files against the schema).",
+		handler: async (args, ctx) => {
+			const store = resolveStore(ctx.cwd).root;
+			const flags = args.trim() ? args.trim().split(/\s+/) : [];
+			try {
+				if (flags.includes("--rebuild-index")) {
+					await withLock(store, () => {
+						rebuildIndex(store);
+					});
+					notify(ctx, "index.json пересобран из голов линий.", "info");
+					return;
+				}
+				const report = flags.includes("--validate") ? validateStore(store) : doctorReport(store);
+				if (report.problems.length === 0) {
+					notify(ctx, flags.includes("--validate") ? "Все файлы прошли проверку." : "Store здоров — проблем нет.", "info");
+				} else {
+					const lines = report.problems.map((p) => `[${p.severity}] ${p.kind}: ${p.message}`);
+					notify(ctx, lines.join("\n"), flags.includes("--validate") ? "error" : "warning");
+				}
+			} catch (e) {
+				notify(ctx, String((e as Error)?.message ?? e), "error");
+			}
 		},
 	});
 
@@ -688,7 +810,7 @@ export default function (pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const handoffPathArg = (params as { handoffPath?: string }).handoffPath;
-			const hp = handoffPathArg || findHandoff(ctx.cwd);
+			const hp = handoffPathArg || findHeadPath(findHandoff(ctx.cwd));
 			if (!hp) {
 				return {
 					content: [
@@ -762,7 +884,7 @@ export default function (pi: ExtensionAPI): void {
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const file = ctx.sessionManager.getSessionFile();
 			const id = deriveSessionId(file);
-			const hp = findHandoff(ctx.cwd);
+			const hp = findHeadPath(findHandoff(ctx.cwd));
 			const obj = { sessionId: id, sessionFile: file ?? null, cwd: ctx.cwd, handoffPath: hp ?? null };
 			return {
 				content: [{ type: "text", text: JSON.stringify(obj, null, 2) }],
@@ -774,11 +896,23 @@ export default function (pi: ExtensionAPI): void {
 	// --- nudge: if a handoff is present when a fresh session starts ---------------
 	pi.on("session_start", async (event, ctx) => {
 		if (event.reason !== "new" && event.reason !== "startup") return;
-		const hp = findHandoff(ctx.cwd);
-		if (!hp) return;
-		const h = readHandoff(hp);
-		if (h) {
-			notify(ctx, `Handoff available from a previous session (${h.driver}). Read it, or run /session-link-show.`, "info");
+		// Capture baseRef (HEAD at start) + startedAt for this session — fed into the
+		// v2 envelope at /session-link so derived commits/filesChanged have a base (§7.3).
+		const sf = ctx.sessionManager.getSessionFile();
+		if (sf) {
+			sessionStartFacts.set(sf, { baseRef: gitHead(ctx.cwd), startedAt: new Date().toISOString() });
+		}
+		const found = findHandoff(ctx.cwd);
+		if (found.kind === "head") {
+			notify(ctx, `Handoff доступен: линия «${found.unit}». Прочитайте его или /session-link-show.`, "info");
+		} else if (found.kind === "legacy") {
+			notify(ctx, `Legacy handoff доступен (${found.path}). /session-link-show.`, "info");
+		} else if (found.kind === "ambiguous") {
+			// §4.3 nudge: list ≤5 active lines (updatedAt desc), hint how to see the rest.
+			const top = found.lines.slice(0, 5);
+			const more = found.lines.length > 5 ? `\n…и ещё ${found.lines.length - 5} — /session-link-show покажет все.` : "";
+			const list = top.map((l) => `- ${l.unit}${l.unitProvisional ? " (provisional)" : ""} [seq=${l.seq}]`).join("\n");
+			notify(ctx, `Несколько активных линий — выберите через unit=:\n${list}${more}`, "info");
 		}
 	});
 
