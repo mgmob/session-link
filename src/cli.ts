@@ -12,10 +12,11 @@
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { findHandoff, readHandoff } from "./handoff.ts";
+import { findHandoff, readHandoff, rebuildIndex } from "./handoff.ts";
 import { resolveParent, walkAncestors } from "./parent.ts";
-import { resolveStore } from "./store.ts";
+import { resolveStore, withLock } from "./store.ts";
 import { renderGraph } from "./graph.ts";
+import { doctorReport, validateStore } from "./doctor.ts";
 
 const PKG = JSON.parse(
 	readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf-8"),
@@ -259,6 +260,28 @@ async function cmdGraph(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numb
 	return { env: envelope(true, "graph", { mermaid: renderGraph(resolveStore(cwdOf(parsed)).root) }), exit: EXIT.ok };
 }
 
+async function cmdDoctor(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const store = resolveStore(cwdOf(parsed)).root;
+	if (parsed.flags.validate) {
+		const r = validateStore(store);
+		if (r.problems.length === 0) return { env: envelope(true, "doctor", { problems: [] }), exit: EXIT.ok };
+		return { env: envelope(false, "doctor", { problems: r.problems }, { code: "invalid", message: `${r.problems.length} validation problem(s)` }), exit: EXIT.invalid };
+	}
+	if (parsed.flags.rebuild) {
+		await withLock(store, () => { rebuildIndex(store); });
+		return { env: envelope(true, "doctor", { rebuilt: true }), exit: EXIT.ok };
+	}
+	const r = doctorReport(store);
+	return { env: envelope(true, "doctor", { problems: r.problems }), exit: EXIT.ok };
+}
+
+async function cmdIndexRebuild(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const store = resolveStore(cwdOf(parsed)).root;
+	await withLock(store, () => { rebuildIndex(store); });
+	return { env: envelope(true, "index", { rebuilt: true }), exit: EXIT.ok };
+}
+
+
 async function dispatch(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
 	const cmd = parsed.command ?? "";
 	switch (cmd) {
@@ -267,6 +290,10 @@ async function dispatch(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numb
 		case "parent": return cmdParent(parsed);
 		case "ancestors": return cmdAncestors(parsed);
 		case "graph": return cmdGraph(parsed);
+		case "doctor": return cmdDoctor(parsed);
+		case "index":
+			if (parsed.positional[0] === "rebuild") return cmdIndexRebuild(parsed);
+			return { env: envelope(false, "index", undefined, { code: "usage", message: "usage: index rebuild" }), exit: EXIT.usage };
 		default:
 			return { env: envelope(false, cmd, undefined, { code: "unknown-command", message: `unknown or unimplemented command: ${cmd || "(none)"}` }), exit: EXIT.usage };
 	}
