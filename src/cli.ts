@@ -9,13 +9,13 @@
  * Commands are wired in incrementally (read → write → platform). Until a command
  * is wired, it falls through to a usage error.
  */
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { findHandoff, forkLine, migrateLegacyHead, readHandoff, rebuildIndex, renameLine, writeLink, type WriteLinkInput } from "./handoff.ts";
+import { findHandoff, forkLine, migrateLegacyHead, readHandoff, rebuildIndex, relocateFromIncoming, renameLine, writeLink, type WriteLinkInput } from "./handoff.ts";
 import type { HandoffV2 } from "./types.ts";
 import { resolveParent, walkAncestors } from "./parent.ts";
-import { resolveStore, withLock } from "./store.ts";
+import { readIncoming, removeIncoming, resolveStore, withLock, writeIncomingPointer } from "./store.ts";
 import { renderGraph } from "./graph.ts";
 import { doctorReport, validateStore } from "./doctor.ts";
 
@@ -364,6 +364,55 @@ async function cmdMigrate(parsed: ParsedArgs): Promise<{ env: Envelope; exit: nu
 	return { env: envelope(true, "migrate", { unit: r.unit, id: r.id, path: r.newPath, provisional: r.provisional }), exit: EXIT.ok };
 }
 
+async function cmdIncoming(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const cwd = cwdOf(parsed);
+	const store = resolveStore(cwd).root;
+	const sub = parsed.positional[0];
+	const unit = flagStr(parsed.flags.unit);
+
+	if (!sub || sub === "list") {
+		const incDir = path.join(store, "incoming");
+		let names: string[] = [];
+		try {
+			names = readdirSync(incDir).filter((f: string) => f.endsWith(".json"));
+		} catch {
+			// no incoming dir
+		}
+		const pointers = names.map((f) => JSON.parse(readFileSync(path.join(incDir, f), "utf-8")));
+		return { env: envelope(true, "incoming", { pointers }), exit: EXIT.ok };
+	}
+	if (sub === "read") {
+		if (!unit) fail("usage", "incoming read requires --unit");
+		const ptr = readIncoming(store, unit);
+		if (!ptr) fail("not-found", `no incoming pointer for ${unit}`);
+		return { env: envelope(true, "incoming", { pointer: ptr }), exit: EXIT.ok };
+	}
+	if (sub === "set") {
+		if (!unit) fail("usage", "incoming set requires --unit");
+		const id = flagStr(parsed.flags.id);
+		const head = flagStr(parsed.flags.head);
+		const src = flagStr(parsed.flags.store);
+		if (!id || !head || !src) fail("usage", "incoming set requires --id, --head, --store (the source store root)");
+		writeIncomingPointer(store, { unit, id, head, store: src });
+		return { env: envelope(true, "incoming", { set: true, unit }), exit: EXIT.ok };
+	}
+	if (sub === "relocate") {
+		if (!unit) fail("usage", "incoming relocate requires --unit");
+		const base: WriteLinkInput = { createdAt: new Date().toISOString(), driver: "pi", sessionRef: "/cli", sessionId: "cli-relocate", cwd, howToAsk: "pi", askCommand: ["pi"] };
+		const raw = readStdin();
+		if (raw.trim()) Object.assign(base, JSON.parse(raw) as Partial<WriteLinkInput>);
+		const r = await withLock(store, () => relocateFromIncoming(store, unit, base));
+		return { env: envelope(true, "incoming", { relocated: true, unit: r.unit, path: r.path }), exit: EXIT.ok };
+	}
+	if (sub === "remove") {
+		if (!unit) fail("usage", "incoming remove requires --unit");
+		removeIncoming(store, unit);
+		return { env: envelope(true, "incoming", { removed: true, unit }), exit: EXIT.ok };
+	}
+	fail("usage", `incoming: unknown subcommand ${sub}`);
+}
+
+
 
 
 async function dispatch(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
@@ -379,6 +428,7 @@ async function dispatch(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numb
 		case "name": return cmdName(parsed);
 		case "fork": return cmdFork(parsed);
 		case "migrate": return cmdMigrate(parsed);
+		case "incoming": return cmdIncoming(parsed);
 		case "index":
 			if (parsed.positional[0] === "rebuild") return cmdIndexRebuild(parsed);
 			return { env: envelope(false, "index", undefined, { code: "usage", message: "usage: index rebuild" }), exit: EXIT.usage };
