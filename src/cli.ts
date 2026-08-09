@@ -12,6 +12,10 @@
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { findHandoff, readHandoff } from "./handoff.ts";
+import { resolveParent, walkAncestors } from "./parent.ts";
+import { resolveStore } from "./store.ts";
+import { renderGraph } from "./graph.ts";
 
 const PKG = JSON.parse(
 	readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf-8"),
@@ -184,15 +188,88 @@ function formatHuman(data: unknown): string {
  * Dispatch a parsed command. Commands are wired in К-2…К-7; until then anything
  * falls through to a usage error. Kept async — write/ask/go will await.
  */
+function cwdOf(parsed: ParsedArgs): string {
+	return parsed.cwd ?? process.cwd();
+}
+function flagStr(v: string | boolean | undefined): string | undefined {
+	return typeof v === "string" ? v : undefined;
+}
+function notFound(command: string, message: string): { env: Envelope; exit: number } {
+	return { env: envelope(false, command, undefined, { code: "not-found", message }), exit: EXIT.notFound };
+}
+
+async function cmdStore(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const cwd = cwdOf(parsed);
+	const r = resolveStore(cwd);
+	return { env: envelope(true, "store", { root: r.root, viaGit: r.viaGit, cwd }), exit: EXIT.ok };
+}
+
+async function cmdShow(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const cwd = cwdOf(parsed);
+	const unit = flagStr(parsed.flags.unit);
+	const found = findHandoff(cwd, unit);
+	if (found.kind === "none") return notFound("show", `no handoff for ${cwd}${unit ? ` (unit=${unit})` : ""}`);
+	if (found.kind === "ambiguous") {
+		return {
+			env: envelope(false, "show", undefined, {
+				code: "ambiguous",
+				message: `multiple active lines; specify --unit. Lines: ${found.lines.map((l) => l.unit).join(", ")}`,
+			}),
+			exit: EXIT.usage,
+		};
+	}
+	const h = readHandoff(found.path);
+	if (!h) return notFound("show", `unreadable handoff at ${found.path}`);
+	return { env: envelope(true, "show", { path: found.path, kind: found.kind, link: h }), exit: EXIT.ok };
+}
+
+async function cmdParent(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const cwd = cwdOf(parsed);
+	const unit = flagStr(parsed.flags.unit);
+	const found = findHandoff(cwd, unit);
+	if (found.kind !== "head" && found.kind !== "legacy") return notFound("parent", "no current line head");
+	const h = readHandoff(found.path);
+	if (!h || h.schema !== "session-link/handoff/v2") return notFound("parent", "the head is not v2 (no parent reference)");
+	const parent = (h as { parent?: { id: string; unit?: string; seq?: number; store?: string } }).parent;
+	if (!parent) return notFound("parent", "the head has no parent reference");
+	const r = resolveParent(parent, resolveStore(cwd).root, { hintPath: h.parentHandoffPath });
+	if (r.kind !== "found") return notFound("parent", `parent not resolved (id ${r.id}; last tried ${r.lastTriedPath ?? "—"})`);
+	return { env: envelope(true, "parent", { path: r.path, store: r.store, via: r.via, movedTo: r.movedTo }), exit: EXIT.ok };
+}
+
+async function cmdAncestors(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const cwd = cwdOf(parsed);
+	const unit = flagStr(parsed.flags.unit);
+	const found = findHandoff(cwd, unit);
+	let links: unknown[] = [];
+	if (found.kind === "head" || found.kind === "legacy") {
+		const h = readHandoff(found.path);
+		if (h) {
+			links = walkAncestors(h, resolveStore(cwd).root).map((a) => ({
+				path: a.path,
+				schema: a.link.schema,
+				id: (a.link as { id?: string }).id ?? null,
+			}));
+		}
+	}
+	return { env: envelope(true, "ancestors", { links }), exit: EXIT.ok };
+}
+
+async function cmdGraph(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	return { env: envelope(true, "graph", { mermaid: renderGraph(resolveStore(cwdOf(parsed)).root) }), exit: EXIT.ok };
+}
+
 async function dispatch(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
 	const cmd = parsed.command ?? "";
-	return {
-		env: envelope(false, cmd, undefined, {
-			code: "unknown-command",
-			message: `unknown or unimplemented command: ${cmd || "(none)"}`,
-		}),
-		exit: EXIT.usage,
-	};
+	switch (cmd) {
+		case "store": return cmdStore(parsed);
+		case "show": return cmdShow(parsed);
+		case "parent": return cmdParent(parsed);
+		case "ancestors": return cmdAncestors(parsed);
+		case "graph": return cmdGraph(parsed);
+		default:
+			return { env: envelope(false, cmd, undefined, { code: "unknown-command", message: `unknown or unimplemented command: ${cmd || "(none)"}` }), exit: EXIT.usage };
+	}
 }
 
 async function main(argv: string[]): Promise<number> {
