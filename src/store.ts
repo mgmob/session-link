@@ -389,6 +389,7 @@ export interface LockContent {
 export class LockBusyError extends Error {
 	readonly lockPath: string;
 	readonly owner: LockContent | undefined;
+	readonly code = "lock-busy";
 	constructor(lockPath: string, owner: LockContent | undefined, timeoutMs: number) {
 		const pid = owner ? ` (pid ${owner.pid})` : "";
 		super(
