@@ -1,8 +1,8 @@
 /**
  * /session-link-graph — render the store as a graph of links and parent edges
  * (contract §9). No deps: plain Mermaid text to stdout; rendering a picture is
- * out of scope. Nodes are links (head + archives of every line); edges are the
- * `parent` reference (§2.5). External parents (v1 / cross-store, not in this
+	 * `parent` reference (§2.5, ancestor-in-time) and the `partOf` reference (decomposition,
+	 *  a separate axis). External targets (v1 / cross-store, not in this
  * store) are shown as leaf nodes so the topology is still visible.
  */
 import * as fs from "node:fs";
@@ -83,6 +83,21 @@ export function renderGraph(store: string): string {
 			declaredExternal.add(parent.id);
 		}
 		lines.push(`  ${nodeKey(id)} --> ${targetKey}`);
+	}
+
+	// "Part-of" edges (decomposition) — separate axis from parent (ancestor-in-time).
+	const declaredPartExternal = new Set<string>();
+	for (const id of keys) {
+		const partOf = nodes.get(id)!.link.partOf;
+		if (!partOf) continue;
+		const inGraph = nodes.has(partOf.id);
+		const targetKey = nodeKey(partOf.id);
+		if (!inGraph && !declaredPartExternal.has(partOf.id)) {
+			const label = partOf.unit ?? "external";
+			lines.push(`  ${targetKey}("${label}\\n(part-of, external)")`);
+			declaredPartExternal.add(partOf.id);
+		}
+		lines.push(`  ${nodeKey(id)} -. part-of .-> ${targetKey}`);
 	}
 
 	return lines.join("\n") + "\n";

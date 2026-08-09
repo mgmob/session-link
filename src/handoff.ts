@@ -259,6 +259,7 @@ export function toMarkdown(h: Handoff): string {
 		lines.push(`- Sequence: ${v2.seq}`);
 		if (v2.lineState && v2.lineState !== "active") lines.push(`- Line state: ${v2.lineState}`);
 		if (v2.parent) lines.push(`- Parent link: \`${v2.parent.id}\`${v2.parent.store ? " (cross-store)" : ""}`);
+		if (v2.partOf) lines.push(`- Part of: \`${v2.partOf.id}\`${v2.partOf.store ? " (cross-store)" : ""} (decomposition)`);
 		if (v2.unitProvisional) lines.push(`- ⚠️ Имя техническое — назовите линию: \\/session-link-name <unit\``);
 	}
 	lines.push("");
