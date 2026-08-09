@@ -15,9 +15,9 @@ const CLI = path.join(process.cwd(), "src", "cli.ts");
 const T1 = new Date(Date.UTC(2026, 7, 9, 10, 0, 0));
 const hex = (s: string) => () => s;
 
-function run(args: string[]): { status: number | null; stdout: string } {
-	const r = cp.spawnSync("node", [CLI, ...args], { cwd: process.cwd(), encoding: "utf-8" });
-	return { status: r.status, stdout: r.stdout ?? "" };
+function run(args: string[], opts: { input?: string } = {}): { status: number | null; stdout: string; stderr: string } {
+	const r = cp.spawnSync("node", [CLI, ...args], { cwd: process.cwd(), encoding: "utf-8", input: opts.input });
+	return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 function jsonOut(stdout: string) {
 	return JSON.parse(stdout.trim()) as { ok: boolean; data?: Record<string, unknown>; error?: { code: string } };
@@ -99,8 +99,9 @@ test("incoming set + relocate finishes a cross-store move; pointer is consumed",
 			"--unit", "alpha", "--id", head.id, "--head", head.path, "--store", sStore,
 		]);
 		assert.equal(set.status, 0);
-
-		const rel = run(["incoming", "relocate", "--unit", "alpha", "--cwd", target, "--json"]);
+		// relocate requires the relocating platform's identity on stdin.
+		const relocInput = JSON.stringify({ driver: "pi", sessionRef: "/cli", sessionId: "cli-relocate", howToAsk: "pi", askCommand: ["pi"] });
+		const rel = run(["incoming", "relocate", "--unit", "alpha", "--cwd", target, "--json"], { input: relocInput });
 		assert.equal(rel.status, 0);
 		assert.equal(jsonOut(rel.stdout).data!.relocated, true);
 

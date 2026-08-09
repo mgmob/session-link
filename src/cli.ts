@@ -162,7 +162,7 @@ Commands:
 Common flags: --cwd <path> · --json · --quiet (-q) · --help (-h) · --version (-V)
 
 Stable surface: --json only. Human output may change between versions.
-Exit codes: 0 ok · 1 not found · 2 usage · 3 store busy · 4 invalid · 5 conflict · 6 invariant`;
+Exit codes: 0 ok · 1 not found · 2 usage/unrecognized · 3 store busy · 4 invalid · 5 conflict · 6 invariant (reserved — not reached by current commands; the core exposes no API to escape the store)`;
 
 /** Map a thrown error to an exit code by its shape (name / code). */
 export function exitCodeFor(e: unknown): number {
@@ -206,6 +206,8 @@ function notFound(command: string, message: string): { env: Envelope; exit: numb
 
 /** Read all of stdin (fd 0); "" if none / not piped. */
 function readStdin(): string {
+	// fd 0 hangs on a TTY with no pipe — refuse to read instead of blocking.
+	if (process.stdin.isTTY) return "";
 	try {
 		return readFileSync(0, "utf-8");
 	} catch {
@@ -249,11 +251,11 @@ async function cmdParent(parsed: ParsedArgs): Promise<{ env: Envelope; exit: num
 	const cwd = cwdOf(parsed);
 	const unit = flagStr(parsed.flags.unit);
 	const found = findHandoff(cwd, unit);
-	if (found.kind !== "head" && found.kind !== "legacy") return notFound("parent", "no current line head");
+	if (found.kind !== "head" && found.kind !== "legacy") return { env: envelope(true, "parent", { parent: null }), exit: EXIT.ok };
 	const h = readHandoff(found.path);
-	if (!h || h.schema !== "session-link/handoff/v2") return notFound("parent", "the head is not v2 (no parent reference)");
+	if (!h || h.schema !== "session-link/handoff/v2") return { env: envelope(true, "parent", { parent: null }), exit: EXIT.ok };
 	const parent = (h as { parent?: { id: string; unit?: string; seq?: number; store?: string } }).parent;
-	if (!parent) return notFound("parent", "the head has no parent reference");
+	if (!parent) return { env: envelope(true, "parent", { parent: null }), exit: EXIT.ok };
 	const r = resolveParent(parent, resolveStore(cwd).root, { hintPath: h.parentHandoffPath });
 	if (r.kind !== "found") return notFound("parent", `parent not resolved (id ${r.id}; last tried ${r.lastTriedPath ?? "—"})`);
 	return { env: envelope(true, "parent", { path: r.path, store: r.store, via: r.via, movedTo: r.movedTo }), exit: EXIT.ok };
@@ -305,6 +307,7 @@ async function cmdIndexRebuild(parsed: ParsedArgs): Promise<{ env: Envelope; exi
 async function cmdWrite(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
 	const cwd = cwdOf(parsed);
 	const raw = readStdin();
+	if (!raw.trim()) fail("usage", "write requires a JSON object on stdin (pipe it in)");
 	let input: WriteLinkInput;
 	try {
 		input = JSON.parse(raw) as WriteLinkInput;
@@ -352,9 +355,14 @@ async function cmdFork(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numbe
 	if (!head || head.schema !== "session-link/handoff/v2") fail("not-found", "fork source is not v2");
 	const v2 = head as HandoffV2;
 	const parentRef = { id: v2.id, unit: v2.unit, seq: v2.seq };
-	const base: WriteLinkInput = { createdAt: new Date().toISOString(), driver: "pi", sessionRef: "/cli", sessionId: "cli-fork", cwd, howToAsk: "pi", askCommand: ["pi"] };
 	const raw = readStdin();
-	if (raw.trim()) Object.assign(base, JSON.parse(raw) as Partial<WriteLinkInput>);
+	if (!raw.trim()) fail("usage", "fork requires a JSON object on stdin — driver/howToAsk/askCommand/sessionRef identify the forking platform (the CLI won't guess; a wrong driver sends later `ask` to the wrong binary)");
+	const base = JSON.parse(raw) as WriteLinkInput;
+	if (!base.driver || !base.howToAsk || !base.askCommand || !base.sessionRef) {
+		fail("usage", "fork stdin must include driver, howToAsk, askCommand, sessionRef");
+	}
+	base.cwd = cwd;
+	base.createdAt = base.createdAt ?? new Date().toISOString();
 	const r = await withLock(store, () => forkLine(store, parentRef, base));
 	return { env: envelope(true, "fork", { unit: r.unit, id: r.id, seq: r.seq, path: r.path }), exit: EXIT.ok };
 }
@@ -402,9 +410,14 @@ async function cmdIncoming(parsed: ParsedArgs): Promise<{ env: Envelope; exit: n
 	}
 	if (sub === "relocate") {
 		if (!unit) fail("usage", "incoming relocate requires --unit");
-		const base: WriteLinkInput = { createdAt: new Date().toISOString(), driver: "pi", sessionRef: "/cli", sessionId: "cli-relocate", cwd, howToAsk: "pi", askCommand: ["pi"] };
 		const raw = readStdin();
-		if (raw.trim()) Object.assign(base, JSON.parse(raw) as Partial<WriteLinkInput>);
+		if (!raw.trim()) fail("usage", "incoming relocate requires a JSON object on stdin — driver/howToAsk/askCommand/sessionRef identify the relocating platform (the CLI won't guess)");
+		const base = JSON.parse(raw) as WriteLinkInput;
+		if (!base.driver || !base.howToAsk || !base.askCommand || !base.sessionRef) {
+			fail("usage", "incoming relocate stdin must include driver, howToAsk, askCommand, sessionRef");
+		}
+		base.cwd = cwd;
+		base.createdAt = base.createdAt ?? new Date().toISOString();
 		const r = await withLock(store, () => relocateFromIncoming(store, unit, base));
 		return { env: envelope(true, "incoming", { relocated: true, unit: r.unit, path: r.path }), exit: EXIT.ok };
 	}
@@ -456,9 +469,20 @@ async function cmdGo(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number 
 	const starter = buildStarterPrompt(found.path, { language: h.language, unitProvisional: (h as HandoffV2).unitProvisional });
 	const bin = driverBin(h.driver);
 	if (!parsed.flags["dry-run"]) {
-		const child = spawnBin(bin, [], { cwd, stdio: "inherit" });
-		try { markCommitted(cwd, new Date().toISOString(), undefined); } catch { /* best-effort */ }
-		return { env: envelope(true, "go", { spawned: bin, pid: child.pid, starterPrompt: starter, note: "starter-prompt is in the response; injecting it into the successor is the caller's (platform-specific) responsibility — the CLI has no inject API" }), exit: EXIT.ok };
+		// claude-code takes a positional prompt → the starter is the successor's
+		// first turn. pi/qwen have no arg-inject for an INTERACTIVE successor (pi -p
+		// is print-mode, not a live successor): the successor starts empty and the
+		// session-link extension's session_start nudges it to the handoff; the
+		// starter is returned for the caller to inject via the platform's mechanism.
+		const spawnArgs = h.driver === "claude-code" ? [starter] : [];
+		const starterInjected = spawnArgs.length > 0;
+		const child = spawnBin(bin, spawnArgs, { cwd, stdio: "inherit" });
+		try {
+			markCommitted(cwd, new Date().toISOString(), undefined);
+		} catch (e) {
+			process.stderr.write(`warning: markCommitted failed (${String((e as Error).message)}); the next \`go\` won't see this successor.\n`);
+		}
+		return { env: envelope(true, "go", { spawned: bin, pid: child.pid, starterInjected, ...(starterInjected ? {} : { starterPrompt: starter }) }), exit: EXIT.ok };
 	}
 	return { env: envelope(true, "go", { spawned: bin, dryRun: true, starterPrompt: starter }), exit: EXIT.ok };
 }

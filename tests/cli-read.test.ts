@@ -118,7 +118,9 @@ test("parent: a first link has no parent → exit 1", async () => {
 	try {
 		await writeLink(cwd, input({ sessionId: "sid-A", unit: "alpha", cwd }), { now: T1, hex: hex("aaaa") });
 		const r = run(["parent", "--cwd", cwd, "--json"]);
-		assert.equal(r.status, 1);
+		// consistent with ancestors: a first link has no parent → ok with parent:null (not an error)
+		assert.equal(r.status, 0);
+		assert.equal((jsonOut(r.stdout).data as { parent: unknown }).parent, null);
 	} finally {
 		rmrf(cwd);
 	}

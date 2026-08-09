@@ -143,7 +143,9 @@ test("fork: forks off an existing line → <unit>-b2", () => {
 	const cwd = tmpProject();
 	try {
 		run(["write", "--cwd", cwd, "--json"], { input: writeInput({ unit: "alpha", sessionId: "sid-A" }) });
-		const r = run(["fork", "--from", "alpha", "--cwd", cwd, "--json"]);
+		// fork requires the forking platform's identity on stdin (driver/howToAsk/askCommand/sessionRef).
+		const forkInput = JSON.stringify({ driver: "pi", sessionRef: "/cli", sessionId: "cli-fork", howToAsk: "pi", askCommand: ["pi"], goal: "g", summary: "s", nextStep: "n" });
+		const r = run(["fork", "--from", "alpha", "--cwd", cwd, "--json"], { input: forkInput });
 		assert.equal(r.status, 0);
 		assert.equal((jsonOut(r.stdout).data as { unit: string }).unit, "alpha-b2");
 	} finally {
