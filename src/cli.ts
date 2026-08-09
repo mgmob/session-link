@@ -12,7 +12,8 @@
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { findHandoff, readHandoff, rebuildIndex } from "./handoff.ts";
+import { findHandoff, forkLine, migrateLegacyHead, readHandoff, rebuildIndex, renameLine, writeLink, type WriteLinkInput } from "./handoff.ts";
+import type { HandoffV2 } from "./types.ts";
 import { resolveParent, walkAncestors } from "./parent.ts";
 import { resolveStore, withLock } from "./store.ts";
 import { renderGraph } from "./graph.ts";
@@ -199,6 +200,22 @@ function notFound(command: string, message: string): { env: Envelope; exit: numb
 	return { env: envelope(false, command, undefined, { code: "not-found", message }), exit: EXIT.notFound };
 }
 
+/** Read all of stdin (fd 0); "" if none / not piped. */
+function readStdin(): string {
+	try {
+		return readFileSync(0, "utf-8");
+	} catch {
+		return "";
+	}
+}
+
+/** Throw with a `code` so exitCodeFor maps it to a semantic exit. */
+function fail(code: string, message: string): never {
+	const e = new Error(message) as Error & { code?: string };
+	e.code = code;
+	throw e;
+}
+
 async function cmdStore(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
 	const cwd = cwdOf(parsed);
 	const r = resolveStore(cwd);
@@ -281,6 +298,73 @@ async function cmdIndexRebuild(parsed: ParsedArgs): Promise<{ env: Envelope; exi
 	return { env: envelope(true, "index", { rebuilt: true }), exit: EXIT.ok };
 }
 
+async function cmdWrite(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const cwd = cwdOf(parsed);
+	const raw = readStdin();
+	let input: WriteLinkInput;
+	try {
+		input = JSON.parse(raw) as WriteLinkInput;
+	} catch (e) {
+		fail("usage", `invalid JSON on stdin: ${String((e as Error).message)}`);
+	}
+	if (!input || typeof input !== "object") fail("usage", "stdin must be a JSON object");
+	input.cwd = cwd; // the writer's cwd wins (§6.1: repo of work = cwd, not the launch dir)
+	const r = await writeLink(cwd, input);
+	return { env: envelope(true, "write", { unit: r.unit, id: r.id, seq: r.seq, path: r.path, case: r.caseName }), exit: EXIT.ok };
+}
+
+async function cmdName(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const cwd = cwdOf(parsed);
+	const store = resolveStore(cwd).root;
+	const newName = parsed.positional[0] ?? flagStr(parsed.flags.new);
+	if (!newName) fail("usage", "name requires the new <unit> (positional or --new)");
+	const unit = flagStr(parsed.flags.unit);
+	const found = findHandoff(cwd, unit);
+	if (found.kind === "legacy") {
+		await withLock(store, () => { migrateLegacyHead(cwd, { unit: newName }); });
+		return { env: envelope(true, "name", { unit: newName, migrated: true }), exit: EXIT.ok };
+	}
+	if (found.kind !== "head") fail("not-found", `no current line${unit ? ` for unit=${unit}` : ""}`);
+	const oldUnit = found.unit;
+	try {
+		await withLock(store, () => { renameLine(store, oldUnit, newName); });
+	} catch (e) {
+		const msg = String((e as Error).message);
+		if (/уже существует|exists/.test(msg)) fail("conflict", msg);
+		if (/недопустим|reserved|invalid|совпадает/.test(msg)) fail("invalid", msg);
+		throw e;
+	}
+	return { env: envelope(true, "name", { unit: newName }), exit: EXIT.ok };
+}
+
+async function cmdFork(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const cwd = cwdOf(parsed);
+	const store = resolveStore(cwd).root;
+	const fromUnit = flagStr(parsed.flags.from);
+	if (!fromUnit) fail("usage", "fork requires --from <unit>");
+	const found = findHandoff(cwd, fromUnit);
+	if (found.kind !== "head") fail("not-found", `no line to fork from: ${fromUnit}`);
+	const head = readHandoff(found.path);
+	if (!head || head.schema !== "session-link/handoff/v2") fail("not-found", "fork source is not v2");
+	const v2 = head as HandoffV2;
+	const parentRef = { id: v2.id, unit: v2.unit, seq: v2.seq };
+	const base: WriteLinkInput = { createdAt: new Date().toISOString(), driver: "pi", sessionRef: "/cli", sessionId: "cli-fork", cwd, howToAsk: "pi", askCommand: ["pi"] };
+	const raw = readStdin();
+	if (raw.trim()) Object.assign(base, JSON.parse(raw) as Partial<WriteLinkInput>);
+	const r = await withLock(store, () => forkLine(store, parentRef, base));
+	return { env: envelope(true, "fork", { unit: r.unit, id: r.id, seq: r.seq, path: r.path }), exit: EXIT.ok };
+}
+
+async function cmdMigrate(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const cwd = cwdOf(parsed);
+	const store = resolveStore(cwd).root;
+	const unit = flagStr(parsed.flags.unit);
+	const r = await withLock(store, () => migrateLegacyHead(cwd, unit ? { unit } : {}));
+	if (!r) fail("not-found", "no legacy v1 head to migrate");
+	return { env: envelope(true, "migrate", { unit: r.unit, id: r.id, path: r.newPath, provisional: r.provisional }), exit: EXIT.ok };
+}
+
+
 
 async function dispatch(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
 	const cmd = parsed.command ?? "";
@@ -291,6 +375,10 @@ async function dispatch(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numb
 		case "ancestors": return cmdAncestors(parsed);
 		case "graph": return cmdGraph(parsed);
 		case "doctor": return cmdDoctor(parsed);
+		case "write": return cmdWrite(parsed);
+		case "name": return cmdName(parsed);
+		case "fork": return cmdFork(parsed);
+		case "migrate": return cmdMigrate(parsed);
 		case "index":
 			if (parsed.positional[0] === "rebuild") return cmdIndexRebuild(parsed);
 			return { env: envelope(false, "index", undefined, { code: "usage", message: "usage: index rebuild" }), exit: EXIT.usage };
