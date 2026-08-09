@@ -171,6 +171,10 @@ export interface HandoffV2 extends HandoffCommon {
 	targetCwd?: string;
 	/** Opaque external blocks (§8). The tool stores/pass-through only — never writes or interprets. */
 	externals?: Record<string, unknown>;
+	/** "Part-of" edge (decomposition): this link is part of ANOTHER line's work, as opposed to
+	 *  `parent` which is "ancestor in time". Separate axis — `resolveParent`/`walkAncestors`
+	 *  ignore it. Same shape as `parent` (reference by id, not path). */
+	partOf?: ParentRef;
 }
 
 /** Any handoff the reader accepts (family {v1, v2}, §7.4). */
