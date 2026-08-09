@@ -12,12 +12,16 @@
 import { readdirSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { findHandoff, forkLine, migrateLegacyHead, readHandoff, rebuildIndex, relocateFromIncoming, renameLine, writeLink, type WriteLinkInput } from "./handoff.ts";
+import { findHandoff, forkLine, markCommitted, migrateLegacyHead, readHandoff, rebuildIndex, relocateFromIncoming, renameLine, validateHandoff, writeLink, type WriteLinkInput } from "./handoff.ts";
 import type { HandoffV2 } from "./types.ts";
 import { resolveParent, walkAncestors } from "./parent.ts";
 import { readIncoming, removeIncoming, resolveStore, withLock, writeIncomingPointer } from "./store.ts";
 import { renderGraph } from "./graph.ts";
 import { doctorReport, validateStore } from "./doctor.ts";
+import { buildStarterPrompt } from "./starter.ts";
+import { querySession } from "./drivers/index.ts";
+import { spawnBin } from "./drivers/spawn.ts";
+import type { DriverName } from "./types.ts";
 
 const PKG = JSON.parse(
 	readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf-8"),
@@ -412,6 +416,53 @@ async function cmdIncoming(parsed: ParsedArgs): Promise<{ env: Envelope; exit: n
 	fail("usage", `incoming: unknown subcommand ${sub}`);
 }
 
+/** Platform binary to spawn for `go` (a successor session). The driver registry
+ *  only knows parsers; spawn is keyed by the handoff's `driver` field. */
+function driverBin(driver: DriverName): string {
+	switch (driver) {
+		case "claude-code": return "claude";
+		case "qwen": return "qwen";
+		case "pi":
+		default:
+			return "pi";
+	}
+}
+
+async function cmdAsk(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const cwd = cwdOf(parsed);
+	const found = findHandoff(cwd, flagStr(parsed.flags.unit));
+	if (found.kind !== "head" && found.kind !== "legacy") fail("not-found", "no handoff to ask");
+	const h = readHandoff(found.path);
+	if (!h) fail("not-found", `unreadable handoff at ${found.path}`);
+	const question = flagStr(parsed.flags.question) ?? readStdin().trim();
+	if (!question) fail("usage", "ask requires --question or the question on stdin");
+	const timeoutMs = Number(flagStr(parsed.flags.timeout) ?? 5 * 60 * 1000);
+	const result = await querySession({ question, handoff: h, timeoutMs });
+	return { env: envelope(true, "ask", { kind: result.kind, text: result.text, driver: result.driver, raw: result.raw, stderr: result.stderr }), exit: EXIT.ok };
+}
+
+async function cmdGo(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
+	const cwd = cwdOf(parsed);
+	const found = findHandoff(cwd, flagStr(parsed.flags.unit));
+	if (found.kind !== "head" && found.kind !== "legacy") fail("not-found", "no handoff to start a successor from");
+	const h = readHandoff(found.path);
+	if (!h) fail("not-found", `unreadable handoff at ${found.path}`);
+	const v = validateHandoff(h);
+	if (!v.ok) fail("invalid", `spine incomplete (missing: ${v.missing.join(", ")}); fill goal/summary/nextStep first`);
+	if (h.committedAt) {
+		const which = h.committedSessionFile ? ` (${path.basename(h.committedSessionFile)})` : "";
+		process.stderr.write(`warning: a session already started from this handoff at ${h.committedAt}${which}; starting again forks a new branch.\n`);
+	}
+	const starter = buildStarterPrompt(found.path, { language: h.language, unitProvisional: (h as HandoffV2).unitProvisional });
+	const bin = driverBin(h.driver);
+	if (!parsed.flags["dry-run"]) {
+		const child = spawnBin(bin, [], { cwd, stdio: "inherit" });
+		try { markCommitted(cwd, new Date().toISOString(), undefined); } catch { /* best-effort */ }
+		return { env: envelope(true, "go", { spawned: bin, pid: child.pid, starterPrompt: starter, note: "starter-prompt is in the response; injecting it into the successor is the caller's (platform-specific) responsibility — the CLI has no inject API" }), exit: EXIT.ok };
+	}
+	return { env: envelope(true, "go", { spawned: bin, dryRun: true, starterPrompt: starter }), exit: EXIT.ok };
+}
+
 
 
 
@@ -429,6 +480,8 @@ async function dispatch(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numb
 		case "fork": return cmdFork(parsed);
 		case "migrate": return cmdMigrate(parsed);
 		case "incoming": return cmdIncoming(parsed);
+		case "ask": return cmdAsk(parsed);
+		case "go": return cmdGo(parsed);
 		case "index":
 			if (parsed.positional[0] === "rebuild") return cmdIndexRebuild(parsed);
 			return { env: envelope(false, "index", undefined, { code: "usage", message: "usage: index rebuild" }), exit: EXIT.usage };
