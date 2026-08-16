@@ -316,7 +316,17 @@ async function cmdWrite(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numb
 	}
 	if (!input || typeof input !== "object") fail("usage", "stdin must be a JSON object");
 	input.cwd = cwd; // the writer's cwd wins (§6.1: repo of work = cwd, not the launch dir)
-	const r = await writeLink(cwd, input);
+	let r: Awaited<ReturnType<typeof writeLink>>;
+	try {
+		r = await writeLink(cwd, input);
+	} catch (e) {
+		// Линк, не прошедший контракт чтения, — `invalid` (4), а не общий отказ:
+		// вызывающий должен отличать «данные не годятся» от «инструмент сломался».
+		// До issue #99 такой линк уходил на диск, а команда рапортовала `ok: true`.
+		const msg = String((e as Error).message);
+		if (/контракт чтения/.test(msg)) fail("invalid", msg);
+		throw e;
+	}
 	return { env: envelope(true, "write", { unit: r.unit, id: r.id, seq: r.seq, path: r.path, case: r.caseName }), exit: EXIT.ok };
 }
 
