@@ -173,6 +173,38 @@ const HANDOFF_SCHEMAS = new Set(["session-link/handoff/v1", "session-link/handof
  * документ более новой формы переживает round-trip через старый инструмент.
  * Полная проверка по схеме — отдельный диагностический режим `--validate`, не здесь.
  */
+/**
+ * Проблемы конверта — ОДИН контракт на чтение и запись (issue #99).
+ *
+ * Было два валидатора: чтение требовало полного конверта, запись не проверяла
+ * ничего. `write` рапортовал `ok: true` и клал на диск линк, который `show` затем
+ * читать отказывался, — а писатель следует рапорту инструмента, перечитывать он
+ * не обязан. Дальше по правилу спауна (#84) `not-found` у указателя означает
+ * эскалацию, а не подъём: сессия, честно завершившаяся handoff'ом, оставляла
+ * преемницу неподнимаемой, и симптома не было — файл на диске есть, ошибок никто
+ * не видел. Два валидатора расходятся молча, поэтому он теперь один.
+ *
+ * Пустой список = конверт читаем. Текст для человека, поэтому по-русски.
+ */
+export function envelopeProblems(obj: Record<string, unknown> | undefined): string[] {
+	if (!obj || typeof obj !== "object") return ["не объект"];
+	const bad: string[] = [];
+	if (!HANDOFF_SCHEMAS.has(obj.schema as string)) bad.push(`schema (${String(obj.schema)})`);
+	if (typeof obj.createdAt !== "string") bad.push("createdAt");
+	if (typeof obj.driver !== "string") bad.push("driver");
+	if (typeof obj.sessionRef !== "string") bad.push("sessionRef");
+	if (typeof obj.cwd !== "string") bad.push("cwd");
+	if (typeof obj.howToAsk !== "string") bad.push("howToAsk");
+	if (!Array.isArray(obj.askCommand)) bad.push("askCommand");
+	if (obj.schema === "session-link/handoff/v2") {
+		if (typeof obj.id !== "string") bad.push("id");
+		if (typeof obj.unit !== "string") bad.push("unit");
+		else if (!UNIT_PATTERN.test(obj.unit)) bad.push(`unit не по шаблону (${obj.unit})`);
+		if (!Number.isInteger(obj.seq)) bad.push("seq");
+	}
+	return bad;
+}
+
 export function readHandoff(p: string): Handoff | undefined {
 	let obj: Record<string, unknown>;
 	try {
@@ -180,22 +212,7 @@ export function readHandoff(p: string): Handoff | undefined {
 	} catch {
 		return undefined;
 	}
-	if (!obj || typeof obj !== "object") return undefined;
-	if (!HANDOFF_SCHEMAS.has(obj.schema as string)) return undefined;
-	// Обязательные поля конверта (общие для v1 и v2).
-	if (typeof obj.createdAt !== "string") return undefined;
-	if (typeof obj.driver !== "string") return undefined;
-	if (typeof obj.sessionRef !== "string") return undefined;
-	if (typeof obj.cwd !== "string") return undefined;
-	if (typeof obj.howToAsk !== "string") return undefined;
-	if (!Array.isArray(obj.askCommand)) return undefined;
-	// Обязательное v2 + regex unit.
-	if (obj.schema === "session-link/handoff/v2") {
-		if (typeof obj.id !== "string") return undefined;
-		if (typeof obj.unit !== "string") return undefined;
-		if (!UNIT_PATTERN.test(obj.unit)) return undefined;
-		if (!Number.isInteger(obj.seq)) return undefined;
-	}
+	if (envelopeProblems(obj).length) return undefined;
 	return obj as unknown as Handoff;
 }
 
@@ -588,6 +605,13 @@ export async function writeLink(
 			const head = locateHead(store, input.unit);
 			const result = buildLink(store, input, head, derived, opts);
 			sanitizeExternals(result.link, opts.log ?? (() => {}));
+			// Отказ ДО записи, а не рапорт об успехе (issue #99): линк, который
+			// `show` читать не станет, на диск не кладём. Проверка — тем же
+			// контрактом, что у чтения; иначе валидаторы разъедутся снова.
+			const problems = envelopeProblems(result.link as unknown as Record<string, unknown>);
+			if (problems.length) {
+				throw new Error(`линк не прошёл контракт чтения — не записан; не хватает: ${problems.join(", ")}`);
+			}
 			persistLink(store, result);
 			return result;
 		},
@@ -689,6 +713,31 @@ function buildLink(
 	} as HandoffV2;
 	if (unitProvisional) link.unitProvisional = true;
 	else delete link.unitProvisional;
+
+	// Выводимое — выводим, а не требуем от каждого писателя (issue #99, п. 2).
+	// `howToAsk`/`askCommand` однозначно строятся из driver + ссылки на сессию, и
+	// заставлять каждого автора линка помнить их форму — приглашение к тому самому
+	// нечитаемому линку. Явно переданные значения не трогаем: писатель мог знать
+	// про свою платформу больше нас (иной путь к бинарю, свои флаги).
+	const refRaw = link.sessionRef || link.sessionId;
+	const ref: string = typeof refRaw === "string" ? refRaw : "";
+	if (link.driver && ref) {
+		if (!Array.isArray(link.askCommand) || link.askCommand.length === 0) {
+			link.askCommand =
+				link.driver === "claude-code"
+					? ["claude", "-p", "--resume", ref, "--allowedTools", "Read,Grep,Glob", "--strict-mcp-config", "--output-format", "json"]
+					: [link.driver === "qwen" ? "qwen" : "pi", "--mode", "json", "--session", ref];
+		}
+		if (typeof link.howToAsk !== "string" || !link.howToAsk) {
+			link.howToAsk = `printf '%s' '<вопрос>' | ${link.askCommand.join(" ")}`;
+		}
+	}
+	// sessionRef обязателен для чтения, а писатели часто заполняют только sessionId
+	// (та же пара разошлась в боевом линке: оба поля несут один id).
+	if (typeof link.sessionRef !== "string" && typeof link.sessionId === "string") link.sessionRef = link.sessionId;
+	// createdAt — момент записи: инструмент знает его точнее писателя, и требовать
+	// его от автора значит превращать очевидное в повод для нечитаемого линка.
+	if (typeof link.createdAt !== "string" || !link.createdAt) link.createdAt = (opts.now ?? new Date()).toISOString();
 
 	if (head && sameSession) mergeBodyForward(link, head.link);
 

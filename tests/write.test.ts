@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { collectDerived } from "../src/store.ts";
-import { writeLink, type WriteLinkInput } from "../src/handoff.ts";
+import { readHandoff, writeLink, type WriteLinkInput } from "../src/handoff.ts";
 import { archivePath, headPath, resolveStore } from "../src/store.ts";
 import type { HandoffV2 } from "../src/types.ts";
 import { rmrf, tmpProject } from "./helpers.ts";
@@ -252,6 +252,55 @@ test("collectDerived: with baseRef in a repo ⇒ commits + filesChanged filled",
 		assert.equal(d.commits?.length, 1, "one commit since base");
 		assert.ok(d.filesChanged?.includes("f.txt"), "committed change listed");
 		assert.ok(d.filesChanged?.includes("dirty.txt"), "uncommitted working-tree file also listed");
+	} finally {
+		rmrf(repo);
+	}
+});
+// ── issue #99: запись валидировала меньше чтения ───────────────────────────────
+// Класс отказа — «инструмент рапортует успех, а результат непригоден»: `write`
+// принимал линк без howToAsk/askCommand, клал его на диск с `ok: true`, а `show`
+// затем читать отказывался. Симптома для писателя нет — файл есть, ошибок нет, —
+// и по правилу спауна (#84) преемница оказывалась неподнимаемой.
+
+test("#99: выводимые поля конверта достраиваются при записи, линк читается назад", async () => {
+	const repo = tmpProject();
+	try {
+		const bare = {
+			driver: "claude-code",
+			sessionId: "11111111-2222-3333-4444-555555555555",
+			cwd: repo,
+			language: "Russian",
+			goal: "g",
+			summary: "s",
+			nextStep: "n",
+		} as unknown as WriteLinkInput;
+
+		const r = await writeLink(repo, bare, { unit: undefined } as never);
+		const back = readHandoff(r.path) as HandoffV2 | undefined;
+
+		assert.ok(back, "линк читается тем же контрактом, которым писался");
+		assert.equal(typeof back!.howToAsk, "string", "howToAsk выведен");
+		assert.ok(Array.isArray(back!.askCommand) && back!.askCommand.length > 0, "askCommand выведен");
+		assert.equal(back!.askCommand[0], "claude", "argv собран под драйвер линка");
+		assert.equal(back!.sessionRef, bare.sessionId, "sessionRef подставлен из sessionId");
+		assert.equal(typeof back!.createdAt, "string", "createdAt проставлен инструментом");
+	} finally {
+		rmrf(repo);
+	}
+});
+
+test("#99: неисправимый линк не пишется вовсе — отказ вместо ok:true", async () => {
+	const repo = tmpProject();
+	try {
+		const hopeless = { cwd: repo, goal: "g", summary: "s", nextStep: "n" } as unknown as WriteLinkInput;
+		await assert.rejects(() => writeLink(repo, hopeless), /контракт чтения/, "запись отклонена");
+		// Каталог стора создаётся под lock раньше записи — потому проверяем отсутствие
+		// САМОГО линка, а не каталога: первая редакция теста падала именно на этом.
+		const store = resolveStore(repo).root;
+		const heads = fs.existsSync(store)
+			? fs.readdirSync(store, { recursive: true, encoding: "utf8" }).filter((f) => String(f).endsWith("handoff.json"))
+			: [];
+		assert.deepEqual(heads, [], "нечитаемый линк на диск не лёг");
 	} finally {
 		rmrf(repo);
 	}
