@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { DerivedFacts, Handoff, HandoffV1, HandoffV2, LineState, ParentRef } from "./types.ts";
 import type { WithLockOptions } from "./store.ts";
-import { archivePath, assignUnit, collectDerived, deriveForkUnitName, generateId, headMdPath, headPath, indexPath, movedToPath, readIncoming, removeIncoming, resolveStore, unitDir, validateUnit, withLock, UNIT_PATTERN } from "./store.ts";
+import { archivePath, assignUnit, collectDerived, deriveForkUnitName, generateId, headMdPath, headPath, indexPath, movedToPath, readIncoming, removeIncoming, resolveStore, unitDir, validateUnit, withLock, PROFILE_PATTERN, UNIT_PATTERN } from "./store.ts";
 import { resolveParent } from "./parent.ts";
 
 /** Directory where the handoff lives for a given project cwd. */
@@ -48,6 +48,8 @@ export interface IndexEntry {
 	state: LineState;
 	cwd: string;
 	unitProvisional?: boolean;
+	/** Mirror of the head's profile (issue #15). Derived — rebuild reproduces it. */
+	profile?: string;
 }
 
 export interface HandoffIndex {
@@ -201,6 +203,8 @@ export function envelopeProblems(obj: Record<string, unknown> | undefined): stri
 		if (typeof obj.unit !== "string") bad.push("unit");
 		else if (!UNIT_PATTERN.test(obj.unit)) bad.push(`unit не по шаблону (${obj.unit})`);
 		if (!Number.isInteger(obj.seq)) bad.push("seq");
+		if (obj.profile !== undefined && (typeof obj.profile !== "string" || !PROFILE_PATTERN.test(obj.profile)))
+			bad.push(`profile не по шаблону (${String(obj.profile)})`);
 	}
 	return bad;
 }
@@ -274,6 +278,7 @@ export function toMarkdown(h: Handoff): string {
 		const v2 = h as HandoffV2;
 		lines.push(`- Line: \`${v2.unit}\``);
 		lines.push(`- Sequence: ${v2.seq}`);
+		if (v2.profile) lines.push(`- Profile: \`${v2.profile}\``);
 		if (v2.lineState && v2.lineState !== "active") lines.push(`- Line state: ${v2.lineState}`);
 		if (v2.parent) lines.push(`- Parent link: \`${v2.parent.id}\`${v2.parent.store ? " (cross-store)" : ""}`);
 		if (v2.partOf) lines.push(`- Part of: \`${v2.partOf.id}\`${v2.partOf.store ? " (cross-store)" : ""} (decomposition)`);
@@ -511,6 +516,10 @@ export interface WriteResult {
 	path: string;
 	caseName: WriteCase;
 	link: HandoffV2;
+	/** Set when the line's profile CHANGED with this write (issue #15): `downgraded`
+	 *  marks the rights-widening direction (anything → plain/absent) that must not
+	 *  pass silently — the CLI prints it and surfaces it in --json. */
+	profileChange?: { from: string | null; to: string | null; downgraded: boolean };
 }
 
 export interface WriteLinkOptions {
@@ -700,6 +709,16 @@ function buildLink(
 	delete rest.baseRef;
 	delete rest.startedAt;
 	delete (rest as { unit?: string }).unit;
+	delete (rest as { profile?: string }).profile;
+
+	// Profile (issue #15): explicit wins, else inherited from the head. "plain"
+	// normalizes to absence — absent ⇔ plain, so old stores and links stay untouched.
+	const profile = normalizeProfile(input.profile, head?.link.profile);
+	const prevProfile = head ? head.link.profile ?? null : null;
+	const profileChange =
+		head && prevProfile !== (profile ?? null)
+			? { from: prevProfile, to: profile ?? null, downgraded: prevProfile !== null && profile === undefined }
+			: undefined;
 
 	const link = {
 		...rest,
@@ -713,6 +732,8 @@ function buildLink(
 	} as HandoffV2;
 	if (unitProvisional) link.unitProvisional = true;
 	else delete link.unitProvisional;
+	if (profile) link.profile = profile;
+	else delete link.profile;
 
 	// Выводимое — выводим, а не требуем от каждого писателя (issue #99, п. 2).
 	// `howToAsk`/`askCommand` однозначно строятся из driver + ссылки на сессию, и
@@ -741,7 +762,20 @@ function buildLink(
 
 	if (head && sameSession) mergeBodyForward(link, head.link);
 
-	return { unit, id, seq, path: headPath(store, unit), caseName, link };
+	return { unit, id, seq, path: headPath(store, unit), caseName, link, profileChange };
+}
+
+
+/** Resolve the link's profile (issue #15): explicit wins, else inherited from the
+ *  line; "plain" normalizes to absence (absent ⇔ plain). Strict — a bad name is
+ *  rejected with a hint, never silently normalized. Returns undefined for plain. */
+function normalizeProfile(explicit: string | undefined, inherited: string | undefined): string | undefined {
+	const raw = explicit !== undefined ? explicit : inherited;
+	if (raw === undefined || raw === "plain") return undefined;
+	if (typeof raw !== "string" || !PROFILE_PATTERN.test(raw)) {
+		throw new Error(`profile "${String(raw)}" недопустим: разрешено [a-z0-9][a-z0-9-]{0,31}. Профиль задаётся явно (write/name/fork --profile) и не выводится из окружения.`);
+	}
+	return raw;
 }
 
 /** Carry agent-authored body fields from `src` onto `dst` ONLY where dst is
@@ -807,6 +841,7 @@ function buildIndexEntry(store: string, unit: string, head: HandoffV2): IndexEnt
 		cwd: head.cwd,
 	};
 	if (head.unitProvisional) entry.unitProvisional = true;
+	if (head.profile) entry.profile = head.profile;
 	return entry;
 }
 
@@ -854,7 +889,7 @@ export interface RenameResult {
  * are byte-identical and links are NOT rewritten — safe by §2.5 (resolution scans
  * by id, step 2). Call under the store lock (a command would wrap this in withLock).
  */
-export function renameLine(store: string, oldUnit: string, newUnit: string): RenameResult {
+export function renameLine(store: string, oldUnit: string, newUnit: string, opts: { profile?: string } = {}): RenameResult {
 	const check = validateUnit(newUnit);
 	if (!check.ok) {
 		const hint = check.suggestion ? ` Возможно, имелось в виду "${check.suggestion}».` : "";
@@ -876,6 +911,10 @@ export function renameLine(store: string, oldUnit: string, newUnit: string): Ren
 		const v2 = head as HandoffV2;
 		v2.unit = newUnit;
 		delete v2.unitProvisional;
+		// Profile follows the line through a rename; an explicit --profile may change it.
+		const renamed = normalizeProfile(opts.profile, v2.profile);
+		if (renamed) v2.profile = renamed;
+		else delete v2.profile;
 		fs.writeFileSync(headP, JSON.stringify(v2, null, 2) + "\n", "utf-8");
 		fs.writeFileSync(headMdPath(store, newUnit), toMarkdown(v2) + "\n", "utf-8");
 	}
@@ -915,6 +954,10 @@ export function forkLine(
 	delete rest.baseRef;
 	delete rest.startedAt;
 	delete (rest as { unit?: string }).unit;
+	delete (rest as { profile?: string }).profile;
+	// The forked line inherits the ancestor's profile (same work context); an
+	// explicit --profile on the fork overrides it.
+	const profile = normalizeProfile(input.profile, p.profile);
 
 	const link = {
 		...rest,
@@ -927,6 +970,8 @@ export function forkLine(
 		derived,
 		unitProvisional: true,
 	} as HandoffV2;
+	if (profile) link.profile = profile;
+
 
 	const result: WriteResult = { unit, id, seq, path: headPath(store, unit), caseName: "first-link", link };
 	persistLink(store, result);
@@ -962,6 +1007,9 @@ export function relocateFromIncoming(
 	delete rest.startedAt;
 	delete (rest as { unit?: string }).unit;
 	delete (rest as { targetCwd?: string }).targetCwd;
+	delete (rest as { profile?: string }).profile;
+	// The relocated line keeps the source line's profile unless the mover overrides.
+	const profile = normalizeProfile(input.profile, p.profile);
 
 	const link = {
 		...rest,
@@ -973,6 +1021,8 @@ export function relocateFromIncoming(
 		parentHandoffPath: ptr.head,
 		derived,
 	} as HandoffV2;
+	if (profile) link.profile = profile;
+
 	if (p.unitProvisional) link.unitProvisional = true;
 
 	const result: WriteResult = { unit: ptr.unit, id, seq, path: headPath(store, ptr.unit), caseName: "first-link", link };

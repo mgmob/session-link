@@ -172,9 +172,15 @@ export interface HandoffV2 extends HandoffCommon {
 	/** Opaque external blocks (§8). The tool stores/pass-through only — never writes or interprets. */
 	externals?: Record<string, unknown>;
 	/** "Part-of" edge (decomposition): this link is part of ANOTHER line's work, as opposed to
-	 *  `parent` which is "ancestor in time". Separate axis — `resolveParent`/`walkAncestors`
-	 *  ignore it. Same shape as `parent` (reference by id, not path). */
+	 * `parent` which is "ancestor in time". Separate axis — `resolveParent`/`walkAncestors`
+	 * ignore it. Same shape as `parent` (reference by id, not path). */
 	partOf?: ParentRef;
+	/** Strictness profile of the line (issue #15): "fleet" | <org profile name>.
+	 * WRITTEN EXPLICITLY (write/name/fork) or inherited along the line — never derived
+	 * from the environment (path, repo name, file presence). Absent ⇒ plain — existing
+	 * stores keep working unchanged. "plain" normalizes to absent. The profile is a
+	 * property of the LINE: it travels with the chain, not with the machine. */
+	profile?: string;
 }
 
 /** Any handoff the reader accepts (family {v1, v2}, §7.4). */
