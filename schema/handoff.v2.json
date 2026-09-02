@@ -37,6 +37,18 @@
       "type": "string",
       "description": "Где должен стартовать преемник. Отсутствует ⇒ = cwd."
     },
+    "partOf": {
+      "type": "object",
+      "description": "Ребро «часть целого» (декомпозиция): это звено — часть работы ДРУГОЙ линии. Ось отдельная от parent (предок по времени); обход предков его игнорирует.",
+      "required": ["id"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "unit": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "store": { "type": "string" }
+      }
+    },
     "model": { "type": "string" },
     "howToAsk": { "type": "string" },
     "askCommand": { "type": "array", "items": { "type": "string" } },
@@ -50,6 +62,11 @@
     "unitProvisional": {
       "type": "boolean",
       "description": "Имя техническое, оператор его не подтверждал. Снимается командой /session-link-name."
+    },
+    "profile": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,31}$",
+      "description": "Профиль строгости линии (issue #15): пишется явно или наследуется по цепочке, из окружения НЕ выводится. Отсутствует ⇔ plain; литерал \"plain\" нормализуется в отсутствие."
     },
     "seq": {
       "type": "integer",

@@ -27,6 +27,12 @@ A green stage = `npm run typecheck` clean **and** `npm test` all passing.
 | `tests/commands.test.ts` | `renderGraph`, `doctorReport`, `validateStore` (§9) |
 | `tests/targetcwd.test.ts` | cross-store relocation via `incoming/` (§2.6) |
 | `tests/externals.test.ts` | `externals` ceiling + fail-soft (§8) |
+| `tests/partof.test.ts` | `partOf` edge: round-trip, graph, ancestry ignores it (К-0) |
+| `tests/profile-core.test.ts` | profile field in the core: inherit/mirror/normalize, downgrade report (П-0) |
+| `tests/profiles-resolve.test.ts` | profile resolution, per-knob combination, org catalog (П-1) |
+| `tests/fleet-cli.test.ts` | fleet/plain in the CLI: DoD 1–5, 8 controls and feature (П-2/3/4) |
+| `tests/starter-template.test.ts` | starter preamble order, missing-template refusal (П-5, DoD 6–7) |
+| `tests/dod15.test.ts` | issue #15 acceptance sweep: each DoD criterion by number (П-6) |
 
 ## Invariant → test map (contract §10)
 

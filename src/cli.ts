@@ -12,7 +12,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { findHandoff, forkLine, markCommitted, migrateLegacyHead, readHandoff, rebuildIndex, relocateFromIncoming, renameLine, validateHandoff, writeLink, type WriteLinkInput } from "./handoff.ts";
+import { findHandoff, forkLine, markCommitted, migrateLegacyHead, readHandoff, rebuildIndex, relocateFromIncoming, renameLine, resolveDefaultUnit, validateHandoff, writeLink, type WriteLinkInput } from "./handoff.ts";
 import type { HandoffV2 } from "./types.ts";
 import { resolveParent, walkAncestors } from "./parent.ts";
 import { readIncoming, removeIncoming, resolveStore, withLock, writeIncomingPointer } from "./store.ts";
@@ -21,7 +21,8 @@ import { doctorReport, validateStore } from "./doctor.ts";
 import { buildStarterPrompt } from "./starter.ts";
 import { querySession } from "./drivers/index.ts";
 import { spawnBin } from "./drivers/spawn.ts";
-import type { DriverName } from "./types.ts";
+import type { DriverName, Handoff } from "./types.ts";
+import { combineStrictness, declaredProfileName, loadTemplate, repoRootOf, resolveProfile, suspiciousReason, type CombinedStrictness, type ResolvedProfile } from "./profiles.ts";
 
 const PKG = JSON.parse(
 	readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf-8"),
@@ -159,6 +160,11 @@ Commands:
   ask                   query a predecessor session via the platform driver
   go                    start a successor (parity with the pi command)
 
+--profile <name> — declare the ASKER's strictness profile on show/go (env
+SESSION_LINK_PROFILE works too; empty = not declared). On write/name/fork it
+sets the LINE's profile. Profiles: plain (default, immutable) · fleet (explicit
+--unit, freshness 7d) · org: <repo>/.session-link/profiles/<name>.{md,json}
+
 Common flags: --cwd <path> · --json · --quiet (-q) · --help (-h) · --version (-V)
 
 Stable surface: --json only. Human output may change between versions.
@@ -222,6 +228,67 @@ function fail(code: string, message: string): never {
 	throw e;
 }
 
+/** The asker's declared profile (issue #15): the --profile flag wins over
+ *  SESSION_LINK_PROFILE; an EMPTY declaration means "not declared", NOT plain —
+ *  a botched `VAR=` substitution in a script must not become an active
+ *  declaration of the weakest mode. Unknown profile ⇒ invalid (4): its
+ *  strictness cannot be guessed. */
+function askerProfileOf(parsed: ParsedArgs, cwd: string): ResolvedProfile | null {
+	const flag = flagStr(parsed.flags.profile);
+	const name = declaredProfileName(flag ?? process.env.SESSION_LINK_PROFILE ?? null);
+	try {
+		return resolveProfile(name, repoRootOf(cwd));
+	} catch (e) {
+		fail("invalid", String((e as Error).message));
+	}
+}
+
+/** The LINE's profile: only a v2 head carries one; legacy never does. Org
+ *  files resolve against the READER's repo root — that is where the org keeps
+ *  them for everyone who works here. */
+function lineProfileOf(h: Handoff, cwd: string): ResolvedProfile | null {
+	if (h.schema !== "session-link/handoff/v2") return null;
+	try {
+		return resolveProfile((h as HandoffV2).profile ?? null, repoRootOf(cwd));
+	} catch (e) {
+		fail("invalid", String((e as Error).message));
+	}
+}
+
+/** Effective strictness for a command over a found link (line + asker). */
+function strictnessFor(parsed: ParsedArgs, cwd: string, h: Handoff): CombinedStrictness {
+	return combineStrictness(lineProfileOf(h, cwd), askerProfileOf(parsed, cwd));
+}
+
+/** Refusal for requireExplicitUnit (issue #15 table): the mode demands an
+ *  explicit --unit even when the store has a single line — that is exactly the
+ *  defect case (a successor would otherwise receive a foreign ok:true link). */
+function explicitUnitRefusal(command: string, cwd: string, c: CombinedStrictness): { env: Envelope; exit: number } {
+	const def = resolveDefaultUnit(resolveStore(cwd).root);
+	const list = def.kind === "ambiguous" ? ` Активные линии: ${def.lines.map((l) => l.unit).join(", ")}.` : "";
+	return {
+		env: envelope(false, command, { strictness: c }, {
+			code: "usage",
+			message: `в этом режиме линия адресуется явно — укажите --unit (правило: явная адресация; источник: ${c.requireExplicitUnit.from}).${list}`,
+		}),
+		exit: EXIT.usage,
+	};
+}
+
+/** The suspicious outcome (П-4): the link is VALID but rejected by rule — the
+ *  message says so explicitly, so a reader never mistakes it for store rot.
+ *  Exit 4 + error.code "suspicious": codes stay coarse (nothing downstream
+ *  distinguishes finer than 0/non-0 — measured), the envelope distinguishes. */
+function suspiciousRefusal(command: string, h: Handoff, c: CombinedStrictness, susp: NonNullable<ReturnType<typeof suspiciousReason>>): { env: Envelope; exit: number } {
+	return {
+		env: envelope(false, command, { strictness: c, suspicious: susp, link: h }, {
+			code: "suspicious",
+			message: `линк валиден, но не принят по правилу профиля: ${susp.message}. Линк не изменён — обновите линию, смените --profile или ослабьте порог.`,
+		}),
+		exit: EXIT.invalid,
+	};
+}
+
 async function cmdStore(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
 	const cwd = cwdOf(parsed);
 	const r = resolveStore(cwd);
@@ -244,7 +311,17 @@ async function cmdShow(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numbe
 	}
 	const h = readHandoff(found.path);
 	if (!h) return notFound("show", `unreadable handoff at ${found.path}`);
-	return { env: envelope(true, "show", { path: found.path, kind: found.kind, link: h }), exit: EXIT.ok };
+
+	// Строгость (issue #15): линия + объявление спрашивающего, поручечно. Источник
+	// каждой сработавшей ручки печатается — иначе «переменную не выставили, и
+	// строгость молча не применилась» неотличимо от «применилась» (поправка).
+	const strictness = strictnessFor(parsed, cwd, h);
+	if (!unit && strictness.requireExplicitUnit.value && found.kind === "head") {
+		return explicitUnitRefusal("show", cwd, strictness);
+	}
+	const susp = suspiciousReason(h, strictness, cwd);
+	if (susp) return suspiciousRefusal("show", h, strictness, susp);
+	return { env: envelope(true, "show", { path: found.path, kind: found.kind, link: h, strictness }), exit: EXIT.ok };
 }
 
 async function cmdParent(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
@@ -316,6 +393,8 @@ async function cmdWrite(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numb
 	}
 	if (!input || typeof input !== "object") fail("usage", "stdin must be a JSON object");
 	input.cwd = cwd; // the writer's cwd wins (§6.1: repo of work = cwd, not the launch dir)
+	const profileFlag = flagStr(parsed.flags.profile);
+	if (profileFlag !== undefined) input.profile = declaredProfileName(profileFlag) ?? undefined;
 	let r: Awaited<ReturnType<typeof writeLink>>;
 	try {
 		r = await writeLink(cwd, input);
@@ -325,9 +404,18 @@ async function cmdWrite(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numb
 		// До issue #99 такой линк уходил на диск, а команда рапортовала `ok: true`.
 		const msg = String((e as Error).message);
 		if (/контракт чтения/.test(msg)) fail("invalid", msg);
+		if (/profile .*недопустим/.test(msg)) fail("invalid", msg);
 		throw e;
 	}
-	return { env: envelope(true, "write", { unit: r.unit, id: r.id, seq: r.seq, path: r.path, case: r.caseName }), exit: EXIT.ok };
+	// Профиль (issue #15): --profile перекрывает и наследование, и stdin; пустое
+	// значение — «не задано» (наследование). Смена и понижение видны в выводе.
+	const data: Record<string, unknown> = { unit: r.unit, id: r.id, seq: r.seq, path: r.path, case: r.caseName };
+	if (r.link.profile) data.profile = r.link.profile;
+	if (r.profileChange) data.profileChange = r.profileChange;
+	if (r.profileChange?.downgraded) {
+		process.stderr.write(`warning: профиль линии понижен ${r.profileChange.from} → ${r.profileChange.to ?? "plain"}: следующая преемница перестанет требовать --unit и проверять свежесть.\n`);
+	}
+	return { env: envelope(true, "write", data), exit: EXIT.ok };
 }
 
 async function cmdName(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
@@ -343,15 +431,19 @@ async function cmdName(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numbe
 	}
 	if (found.kind !== "head") fail("not-found", `no current line${unit ? ` for unit=${unit}` : ""}`);
 	const oldUnit = found.unit;
+	// --profile на переименовании меняет профиль линии; пустое значение —
+	// явный понижение до plain (убрать профиль).
+	const profileFlag = flagStr(parsed.flags.profile);
+	const profileOpts = profileFlag === undefined ? {} : { profile: declaredProfileName(profileFlag) ?? "plain" };
 	try {
-		await withLock(store, () => { renameLine(store, oldUnit, newName); });
+		await withLock(store, () => { renameLine(store, oldUnit, newName, profileOpts); });
 	} catch (e) {
 		const msg = String((e as Error).message);
 		if (/уже существует|exists/.test(msg)) fail("conflict", msg);
 		if (/недопустим|reserved|invalid|совпадает/.test(msg)) fail("invalid", msg);
 		throw e;
 	}
-	return { env: envelope(true, "name", { unit: newName }), exit: EXIT.ok };
+	return { env: envelope(true, "name", { unit: newName, ...(profileFlag !== undefined ? { profile: declaredProfileName(profileFlag) ?? "plain" } : {}) }), exit: EXIT.ok };
 }
 
 async function cmdFork(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number }> {
@@ -373,6 +465,8 @@ async function cmdFork(parsed: ParsedArgs): Promise<{ env: Envelope; exit: numbe
 	}
 	base.cwd = cwd;
 	base.createdAt = base.createdAt ?? new Date().toISOString();
+	const profileFlag = flagStr(parsed.flags.profile);
+	if (profileFlag !== undefined) base.profile = declaredProfileName(profileFlag) ?? undefined;
 	const r = await withLock(store, () => forkLine(store, parentRef, base));
 	return { env: envelope(true, "fork", { unit: r.unit, id: r.id, seq: r.seq, path: r.path }), exit: EXIT.ok };
 }
@@ -470,13 +564,36 @@ async function cmdGo(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number 
 	if (found.kind !== "head" && found.kind !== "legacy") fail("not-found", "no handoff to start a successor from");
 	const h = readHandoff(found.path);
 	if (!h) fail("not-found", `unreadable handoff at ${found.path}`);
+
+	// Строгость (issue #15) — ДО спавна: подозрительный/неадресованный линк не
+	// должен запускать преемницу (DoD 8: ни через show, ни через go).
+	const strictness = strictnessFor(parsed, cwd, h);
+	if (!flagStr(parsed.flags.unit) && strictness.requireExplicitUnit.value && found.kind === "head") {
+		const r = explicitUnitRefusal("go", cwd, strictness);
+		return r;
+	}
+	const susp = suspiciousReason(h, strictness, cwd);
+	if (susp) return suspiciousRefusal("go", h, strictness, susp);
+
 	const v = validateHandoff(h);
 	if (!v.ok) fail("invalid", `spine incomplete (missing: ${v.missing.join(", ")}); fill goal/summary/nextStep first`);
 	if (h.committedAt) {
 		const which = h.committedSessionFile ? ` (${path.basename(h.committedSessionFile)})` : "";
 		process.stderr.write(`warning: a session already started from this handoff at ${h.committedAt}${which}; starting again forks a new branch.\n`);
 	}
-	const starter = buildStarterPrompt(found.path, { language: h.language, unitProvisional: (h as HandoffV2).unitProvisional });
+	// Preamble из профиля ЛИНИИ (issue #15): организационные шаги преемника.
+	// Обязательный шаблон (templateRequired) при отсутствии файла — отказ:
+	// тихой подстановки пустого блока быть не должно (DoD 6).
+	const lineProfile = lineProfileOf(h, cwd);
+	let preamble = "";
+	if (lineProfile?.templateRequired) {
+		try {
+			preamble = loadTemplate(lineProfile);
+		} catch (e) {
+			fail("invalid", String((e as Error).message));
+		}
+	}
+	const starter = buildStarterPrompt(found.path, { language: h.language, unitProvisional: (h as HandoffV2).unitProvisional, preamble });
 	const bin = driverBin(h.driver);
 	if (!parsed.flags["dry-run"]) {
 		// claude-code takes a positional prompt → the starter is the successor's

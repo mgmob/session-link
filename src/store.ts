@@ -30,6 +30,11 @@ export const ID_PATTERN = /^[0-9]{8}T[0-9]{9}-[0-9a-f]{4}$/;
  *  Strict — no silent normalization; a violation is rejected with a sluggify hint. */
 export const UNIT_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
+/** Profile-name regex (issue #15): lowercase alnum + hyphens, 1–32 chars.
+ *  Strict like UNIT_PATTERN — a bad name is rejected, not normalized. Profile names
+ *  are FILES in the org repo (<name>.md/.json), not store dirs, so no Windows-reserved check. */
+export const PROFILE_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
 /** Windows-reserved names (§3.1): a dir of this name can't be created on Windows.
  *  Case- and extension-insensitive — "CON", "con.txt" are both blocked. */
 const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
