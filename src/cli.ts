@@ -22,7 +22,7 @@ import { buildStarterPrompt } from "./starter.ts";
 import { querySession } from "./drivers/index.ts";
 import { spawnBin } from "./drivers/spawn.ts";
 import type { DriverName, Handoff } from "./types.ts";
-import { combineStrictness, declaredProfileName, repoRootOf, resolveProfile, suspiciousReason, type CombinedStrictness, type ResolvedProfile } from "./profiles.ts";
+import { combineStrictness, declaredProfileName, loadTemplate, repoRootOf, resolveProfile, suspiciousReason, type CombinedStrictness, type ResolvedProfile } from "./profiles.ts";
 
 const PKG = JSON.parse(
 	readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf-8"),
@@ -581,7 +581,19 @@ async function cmdGo(parsed: ParsedArgs): Promise<{ env: Envelope; exit: number 
 		const which = h.committedSessionFile ? ` (${path.basename(h.committedSessionFile)})` : "";
 		process.stderr.write(`warning: a session already started from this handoff at ${h.committedAt}${which}; starting again forks a new branch.\n`);
 	}
-	const starter = buildStarterPrompt(found.path, { language: h.language, unitProvisional: (h as HandoffV2).unitProvisional });
+	// Preamble из профиля ЛИНИИ (issue #15): организационные шаги преемника.
+	// Обязательный шаблон (templateRequired) при отсутствии файла — отказ:
+	// тихой подстановки пустого блока быть не должно (DoD 6).
+	const lineProfile = lineProfileOf(h, cwd);
+	let preamble = "";
+	if (lineProfile?.templateRequired) {
+		try {
+			preamble = loadTemplate(lineProfile);
+		} catch (e) {
+			fail("invalid", String((e as Error).message));
+		}
+	}
+	const starter = buildStarterPrompt(found.path, { language: h.language, unitProvisional: (h as HandoffV2).unitProvisional, preamble });
 	const bin = driverBin(h.driver);
 	if (!parsed.flags["dry-run"]) {
 		// claude-code takes a positional prompt → the starter is the successor's

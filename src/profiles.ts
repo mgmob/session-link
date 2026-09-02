@@ -64,8 +64,13 @@ export interface ResolvedProfile {
 	name: string;
 	builtin: boolean;
 	knobs: StrictnessKnobs;
-	/** Absolute path of the org-steps template, when one exists. */
+	/** Absolute path of the org-steps template, when one exists/is expected. */
 	templatePath?: string;
+	/** true — the starter MUST include this template; unreadable/missing file at
+	 *  successor-start is a REFUSAL naming the path (DoD 6). Set for builtin
+	 *  non-plain presets (their starter contract includes the block) and for org
+	 *  profiles that declare a .md. */
+	templateRequired?: boolean;
 }
 
 /** Where org profiles live, relative to the repo root. */
@@ -166,14 +171,23 @@ export function resolveProfile(name: string | null, repoRoot: string): ResolvedP
 	const hasTemplate = fs.existsSync(templatePath);
 	if (name in BUILTIN_PRESETS) {
 		const knobs = { ...BUILTIN_PRESETS[name], ...orgKnobs };
-		return { name, builtin: true, knobs, ...(hasTemplate ? { templatePath } : {}) };
+		// Builtin non-plain presets REQUIRE their template: the fleet starter
+		// contract is "7 steps + the org block" (issue table), so a missing fleet.md
+		// at successor-start is a REFUSAL naming the path (DoD 6), not a silent
+		// empty block — silence here is indistinguishable from "no org steps
+		// required", and that is how mandatory checks get lost.
+		return name === "plain"
+			? { name, builtin: true, knobs }
+			: { name, builtin: true, knobs, templatePath, templateRequired: true };
 	}
 	if (!orgKnobs && !hasTemplate) {
 		throw new Error(
 			`профиль "${name}" не найден: нет ни ${path.join(PROFILES_SUBDIR, name + ".json")}, ни ${path.join(PROFILES_SUBDIR, name + ".md")} в корне репозитория. Профиль не выводится из окружения — объявите существующий или создайте файл.`,
 		);
 	}
-	return { name, builtin: false, knobs: orgKnobs ?? {}, ...(hasTemplate ? { templatePath } : {}) };
+	// Org profile: a .md IS the declaration of org steps → required; knobs alone
+	// means the org chose strictness without steps → no block, no refusal.
+	return { name, builtin: false, knobs: orgKnobs ?? {}, ...(hasTemplate ? { templatePath, templateRequired: true } : {}) };
 }
 
 /** Load the org-steps template text. A missing file is a REFUSAL, not a silent

@@ -6,7 +6,7 @@
  */
 export function buildStarterPrompt(
 	handoffFile: string,
-	opts: { language?: string; unitProvisional?: boolean } = {},
+	opts: { language?: string; unitProvisional?: boolean; preamble?: string; postamble?: string } = {},
 ): string {
 	const lines: string[] = [];
 	lines.push("# Context handoff (auto-started by /session-link)");
@@ -19,6 +19,15 @@ export function buildStarterPrompt(
 				opts.language +
 				"** throughout this entire session — every status update, understanding report, and summary. Match the user's language; do not switch to English unless I do.",
 		);
+	}
+	// Preamble (issue #15): the org-steps block, BEFORE the seven steps. The
+	// plugin inserts it verbatim — it never interprets org texts (the plugin
+	// must not know organizations, only that a profile may carry a block).
+	if (opts.preamble) {
+		lines.push("");
+		lines.push(opts.preamble);
+		lines.push("");
+		lines.push("---");
 	}
 	lines.push("");
 	lines.push("The previous session handed off context. The handoff is at:");
@@ -41,5 +50,9 @@ export function buildStarterPrompt(
 	}
 	lines.push("");
 	lines.push("Narrate each step so I can follow along.");
+	if (opts.postamble) {
+		lines.push("");
+		lines.push(opts.postamble);
+	}
 	return lines.join("\n");
 }

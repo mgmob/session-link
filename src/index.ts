@@ -55,6 +55,7 @@ import { resolveStore, withLock } from "./store.ts";
 import { renderGraph } from "./graph.ts";
 import { doctorReport, validateStore } from "./doctor.ts";
 import { querySession } from "./drivers/index.ts";
+import { combineStrictness, declaredProfileName, loadTemplate, repoRootOf, resolveProfile, suspiciousReason } from "./profiles.ts";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.SESSION_LINK_TIMEOUT_MS || 5 * 60 * 1000);
 const PI_TOOLS_ALLOWLIST = process.env.SESSION_LINK_PI_TOOLS || "read,grep,find,ls";
@@ -619,7 +620,22 @@ export default function (pi: ExtensionAPI): void {
 				);
 			}
 			const parentSession = ctx.sessionManager.getSessionFile() ?? undefined;
-			const starterPrompt = buildStarterPrompt(hp, { language: h.language, unitProvisional: (h as HandoffV2).unitProvisional });
+			// Preamble из профиля ЛИНИИ (issue #15): обязательный шаблон без файла —
+			// отказ БЕЗ старта преемника (DoD 6: молчаливый запуск с пустым блоком —
+			// провал критерия).
+			let preamble = "";
+			if (h.schema === "session-link/handoff/v2") {
+				const lineProfile = resolveProfile((h as HandoffV2).profile ?? null, repoRootOf(ctx.cwd));
+				if (lineProfile?.templateRequired) {
+					try {
+						preamble = loadTemplate(lineProfile);
+					} catch (e) {
+						notify(ctx, String((e as Error).message), "error");
+						return;
+					}
+				}
+			}
+			const starterPrompt = buildStarterPrompt(hp, { language: h.language, unitProvisional: (h as HandoffV2).unitProvisional, preamble });
 			const cwd = ctx.cwd;
 			const title = nameClosingSession(pi, h);
 			const committedAt = new Date().toISOString();
@@ -869,8 +885,31 @@ export default function (pi: ExtensionAPI): void {
 			sessionStartFacts.set(sf, { baseRef: gitHead(ctx.cwd), startedAt: new Date().toISOString() });
 		}
 		const found = findHandoff(ctx.cwd);
+		// Строгость старта (issue #15): если эффективный режим требует явной
+		// адресации или линк подозрителен — nudge НЕ называет линию по умолчанию,
+		// чтобы авто-подсказка не стала каналом того самого чужого линка (DoD 8).
 		if (found.kind === "head") {
-			notify(ctx, `Handoff доступен: линия «${found.unit}». Прочитайте его или /session-link-show.`, "info");
+			const h = readHandoff(found.path);
+			if (h) {
+				try {
+					const asker = resolveProfile(declaredProfileName(process.env.SESSION_LINK_PROFILE ?? null), repoRootOf(ctx.cwd));
+					const line = resolveProfile((h as HandoffV2).profile ?? null, repoRootOf(ctx.cwd));
+					const c = combineStrictness(line, asker);
+					const susp = suspiciousReason(h, c, ctx.cwd);
+					if (c.requireExplicitUnit.value) {
+						notify(ctx, `Режим требует явной адресации линии (источник: ${c.requireExplicitUnit.from}). Не берите линию по умолчанию — спросите владельца или укажите unit явно.`, "info");
+					} else if (susp) {
+						notify(ctx, `Линия «${found.unit}» доступна, но линк подозрителен: ${susp.message}. Спросите владельца, прежде чем работать с ней.`, "warning");
+					} else {
+						notify(ctx, `Handoff доступен: линия «${found.unit}». Прочитайте его или /session-link-show.`, "info");
+					}
+				} catch {
+					// профиль линии не разрешился (напр. неизвестный) — nudge молчит о линии,
+					// но не ломает старт сессии
+				}
+			} else {
+				notify(ctx, `Handoff доступен: линия «${found.unit}». Прочитайте его или /session-link-show.`, "info");
+			}
 		} else if (found.kind === "legacy") {
 			notify(ctx, `Legacy handoff доступен (${found.path}). /session-link-show.`, "info");
 		} else if (found.kind === "ambiguous") {
