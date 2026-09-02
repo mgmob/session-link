@@ -239,3 +239,54 @@ export function combineStrictness(line: ResolvedProfile | null, asker: ResolvedP
 		askerProfile: asker ? asker.name : null,
 	};
 }
+
+/** Why a found link was deemed suspicious (issue #15, П-4). */
+export interface SuspiciousReason {
+	reason: "stale" | "driver" | "cwd";
+	/** Names the rule, the measurement AND the threshold — the reader must see
+	 *  BY WHICH RULE the link was rejected (the issue's demand). */
+	message: string;
+	/** Knob source that fired, for machine consumers. */
+	source: "line" | "asker" | "line+asker";
+}
+
+/** Check a FOUND link against the combined strictness (П-4). The link itself is
+ *  VALID — the outcome must read "rejected by rule", never "corrupt": a reader
+ *  who mistakes this for store rot goes to fix the wrong thing. */
+export function suspiciousReason(
+	h: { driver: string; cwd: string; createdAt: string; committedAt?: string },
+	c: CombinedStrictness,
+	readerCwd: string,
+	now: Date = new Date(),
+): SuspiciousReason | undefined {
+	if (c.maxAgeDays.value != null) {
+		const ts = h.committedAt ?? h.createdAt;
+		const ageDays = (now.getTime() - Date.parse(ts)) / 86_400_000;
+		if (Number.isFinite(ageDays) && ageDays > c.maxAgeDays.value) {
+			return {
+				reason: "stale",
+				source: knobSource(c.maxAgeDays.from),
+				message: `возраст ${ageDays.toFixed(1)} сут > порога ${c.maxAgeDays.value} сут (правило: свежесть; источник: ${c.maxAgeDays.from})`,
+			};
+		}
+	}
+	if (c.expectedDriver.value && h.driver !== c.expectedDriver.value) {
+		return {
+			reason: "driver",
+			source: knobSource(c.expectedDriver.from),
+			message: `driver «${h.driver}» ≠ ожидаемому «${c.expectedDriver.value}» (правило: платформа; источник: ${c.expectedDriver.from})`,
+		};
+	}
+	if (c.checkCwd.value && repoRootOf(h.cwd) !== repoRootOf(readerCwd)) {
+		return {
+			reason: "cwd",
+			source: knobSource(c.checkCwd.from),
+			message: `линк описывает «${h.cwd}», а читатель в «${readerCwd}» (правило: репозиторий; источник: ${c.checkCwd.from})`,
+		};
+	}
+	return undefined;
+}
+
+function knobSource(from: Knob<unknown>["from"]): "line" | "asker" | "line+asker" {
+	return from === "default" ? "line" : from;
+}
