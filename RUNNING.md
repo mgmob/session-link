@@ -54,6 +54,23 @@ the parts that can only diverge across platforms — resolution of the store fro
 different cwd, the lock with a live writer on the other side, index behaviour. The
 manual run above is what catches those.
 
+## Strictness profiles (issue #15, §9 of the spec)
+
+```bash
+session-link show --cwd X --json                      # plain: as before, nothing new required
+session-link show --cwd X --profile fleet --json        # asker declares fleet (or env SESSION_LINK_PROFILE)
+echo '{…,"profile":"fleet"}' | session-link write …   # the LINE's profile — inherited along the chain
+```
+
+- effective strictness = line profile + asker declaration, combined per knob
+  (booleans OR, thresholds MIN); `data.strictness` prints every applied knob WITH its source;
+- fleet: `--unit` required even for a single line; links older than the threshold or with a
+  foreign driver are `error.code:"suspicious"` (exit 4) — valid but rejected by rule, with the
+  threshold named;
+- org profiles: `<repo-root>/.session-link/profiles/<name>.json` (knobs) + `<name>.md` (starter
+  template — required for fleet; missing file ⇒ `go` refuses to start a successor);
+- unknown profile ⇒ exit 4, never a silent plain; empty `--profile`/env = not declared.
+
 ## Exit codes (§5)
 
-`0` ok · `1` not found · `2` usage · `3` store busy · `4` invalid · `5` conflict · `6` invariant
+`0` ok · `1` not found · `2` usage · `3` store busy · `4` invalid (+ `suspicious`) · `5` conflict · `6` invariant

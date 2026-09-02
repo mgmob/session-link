@@ -14,7 +14,7 @@ import * as path from "node:path";
 
 import { buildIndex, readHandoff, readIndex } from "./handoff.ts";
 import { resolveParent } from "./parent.ts";
-import { headPath, ID_PATTERN, isLockStale, unitDir, UNIT_PATTERN } from "./store.ts";
+import { headPath, ID_PATTERN, isLockStale, PROFILE_PATTERN, unitDir, UNIT_PATTERN } from "./store.ts";
 import type { Handoff, HandoffV2 } from "./types.ts";
 
 export type Severity = "error" | "warn";
@@ -85,6 +85,9 @@ export function validateDocument(obj: unknown): string[] {
 		if (typeof o.unit !== "string") issues.push("v2 требует строковый unit");
 		else if (!UNIT_PATTERN.test(o.unit)) issues.push(`unit не соответствует regex: ${o.unit}`);
 		if (!Number.isInteger(o.seq)) issues.push("v2 требует целочисленный seq");
+		if (o.profile !== undefined && (typeof o.profile !== "string" || !PROFILE_PATTERN.test(o.profile))) {
+			issues.push(`profile не соответствует regex: ${String(o.profile)}`);
+		}
 	}
 	return issues;
 }
