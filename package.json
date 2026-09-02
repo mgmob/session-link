@@ -1,6 +1,6 @@
 {
   "name": "session-link",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "session-link: persistent lines of work across agent sessions — a context-handoff core (store, lineage, derived facts) shared by a pi extension and a thin CLI. Writes a handoff and auto-starts the next session, which can query the previous one headlessly. Portable driver model (pi / claude-code / qwen).",
   "type": "module",
   "bin": {
